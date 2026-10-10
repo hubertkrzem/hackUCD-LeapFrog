@@ -61,6 +61,10 @@ final class LiveMapModel {
     private(set) var estimatedPositions: [String: BusTracker.Estimate] = [:]
     private(set) var positionsVersion = 0
     @ObservationIgnored private var tracker: BusTracker?
+    /// Where each DART is on the track, refreshed alongside `estimatedPositions`.
+    private(set) var trainPlacements: [String: RailTracker.Placement] = [:]
+    private(set) var railShapes: [RouteShape] = []
+    @ObservationIgnored private var railTracker: RailTracker?
     var enabledModes: Set<TransportMode> = Set(TransportMode.allCases) {
         didSet { recomputeDisplayed() }
     }
@@ -89,7 +93,8 @@ final class LiveMapModel {
     private var nextIrishRailAt: Date = .distantPast
     private var filterGeneration = 0
     #if DEBUG
-    private var synthetic: SyntheticFeed? = SyntheticFeed.requestedCount > 0 ? SyntheticFeed(count: SyntheticFeed.requestedCount) : nil
+    private var synthetic: SyntheticFeed? = SyntheticFeed.requestedCount > 0 || SyntheticFeed.requestedTrains > 0
+        ? SyntheticFeed(count: SyntheticFeed.requestedCount, trains: SyntheticFeed.requestedTrains) : nil
     #endif
 
     init(apiKey: String? = Secrets.ntaAPIKey) {
@@ -166,6 +171,7 @@ final class LiveMapModel {
 
     /// Snaps buses to their routes and moves each to its estimated position now.
     private func trackBuses(_ merged: [Vehicle]) -> [Vehicle] {
+        railTracker?.ingest(merged)
         guard let tracker else { return merged }
         tracker.ingest(merged.filter { $0.source == .nta })
         #if DEBUG
@@ -179,12 +185,18 @@ final class LiveMapModel {
     /// Advances every tracked bus on screen along its route, once a second.
     private func runEstimates() async {
         while !Task.isCancelled {
-            if let tracker {
+            if tracker != nil || railTracker != nil {
                 var positions: [String: BusTracker.Estimate] = [:]
-                for vehicle in displayedVehicles where vehicle.mode == .bus {
-                    positions[vehicle.id] = tracker.estimate(for: vehicle.id)
+                var placements: [String: RailTracker.Placement] = [:]
+                for vehicle in displayedVehicles {
+                    switch vehicle.mode {
+                    case .bus: positions[vehicle.id] = tracker?.estimate(for: vehicle.id)
+                    case .dart: placements[vehicle.id] = railTracker?.placement(for: vehicle.id)
+                    case .luas: break
+                    }
                 }
                 estimatedPositions = positions
+                trainPlacements = placements
                 positionsVersion += 1
             }
             try? await Task.sleep(for: .seconds(1))
@@ -221,6 +233,11 @@ final class LiveMapModel {
         if tracker == nil, let store = try? await BusRouteStore.loadFromBundle() {
             tracker = BusTracker(store: store)
         }
+        if railTracker == nil {
+            let network = RailNetwork(data: data)
+            railTracker = RailTracker(network: network)
+            railShapes = network.shapes
+        }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.pollFeeds() }
             group.addTask { await self.runEstimates() }
@@ -230,8 +247,8 @@ final class LiveMapModel {
     private func pollFeeds() async {
         while !Task.isCancelled {
             #if DEBUG
-            if var feed = synthetic, let store = tracker?.store {
-                let fake = feed.tick(data: data, routes: store)
+            if var feed = synthetic, let store = tracker?.store, let rail = railTracker?.network {
+                let fake = feed.tick(data: data, routes: store, rail: rail)
                 synthetic = feed
                 setVehicles(trackBuses(fake))
                 status = .live

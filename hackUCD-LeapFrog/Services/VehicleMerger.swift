@@ -30,7 +30,8 @@ nonisolated enum VehicleMerger {
                     bearing: nil,
                     timestamp: now,
                     source: .irishRail,
-                    tripId: train.code
+                    tripId: train.code,
+                    rail: train.railStatus
                 )
             }
         }
