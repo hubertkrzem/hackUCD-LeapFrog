@@ -2,10 +2,48 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var model = LiveMapModel()
-    @State private var showingSearch = false
+    @State private var menu = BottomMenu.Detent.launchState
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
+        GeometryReader { geometry in
+            let safeArea = geometry.safeAreaInsets
+            ZStack(alignment: .bottom) {
+                content(controlsInset: BottomMenu.collapsedContentHeight + safeArea.bottom)
+                BottomMenu(
+                    detent: $menu,
+                    model: model,
+                    screenHeight: geometry.size.height + safeArea.top + safeArea.bottom,
+                    safeArea: safeArea,
+                    onPickStop: { model.focus(on: $0) }
+                )
+            }
+            // The menu runs to the bottom edge; it pads for the home indicator itself.
+            .ignoresSafeArea(.container, edges: .bottom)
+        }
+        .tint(Theme.green)
+        .preferredColorScheme(.light)
+        // Poll only while active; the task is cancelled when the scene backgrounds.
+        .task(id: scenePhase == .active) {
+            guard scenePhase == .active else { return }
+            await model.run()
+        }
+        .sheet(item: $model.selection) { selection in
+            Group {
+                switch selection {
+                case .stop(let stop): StopDetailSheet(stop: stop, model: model)
+                case .vehicle(let vehicle): VehicleDetailSheet(vehicle: vehicle, model: model)
+                }
+            }
+            .presentationDetents([.fraction(0.38), .large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(28)
+            .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.38)))
+        }
+    }
+
+    /// The map plus its floating chrome; the bottom menu is layered over this.
+    private func content(controlsInset: CGFloat) -> some View {
         ZStack {
             TransitMapView(
                 data: model.data,
@@ -40,44 +78,23 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
-                HStack {
-                    Spacer()
-                    MapControls(
-                        onSearch: { showingSearch = true },
-                        onLocate: { model.showUserLocation() },
-                        onHome: { model.showDublin() }
-                    )
+                if menu == .collapsed {
+                    HStack {
+                        Spacer()
+                        MapControls(
+                            onLocate: { model.showUserLocation() },
+                            onHome: { model.showDublin() }
+                        )
+                    }
+                    .transition(.opacity)
                 }
-                ModeFilterBar(model: model)
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-        }
-        .tint(Theme.green)
-        .preferredColorScheme(.light)
-        // Poll only while active; the task is cancelled when the scene backgrounds.
-        .task(id: scenePhase == .active) {
-            guard scenePhase == .active else { return }
-            await model.run()
-        }
-        .sheet(item: $model.selection) { selection in
-            Group {
-                switch selection {
-                case .stop(let stop): StopDetailSheet(stop: stop, model: model)
-                case .vehicle(let vehicle): VehicleDetailSheet(vehicle: vehicle, model: model)
-                }
-            }
-            .presentationDetents([.fraction(0.38), .large])
-            .presentationDragIndicator(.visible)
-            .presentationCornerRadius(28)
-            .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.38)))
-        }
-        .sheet(isPresented: $showingSearch) {
-            SearchSheet(model: model) { stop in
-                showingSearch = false
-                model.focus(on: stop)
-            }
-            .presentationDragIndicator(.visible)
+            .padding(.top, 8)
+            // Keep the controls just above the collapsed menu.
+            .padding(.bottom, controlsInset + 12)
+            // The keyboard only appears with full-screen search, which covers this layer.
+            .ignoresSafeArea(.keyboard)
         }
     }
 }

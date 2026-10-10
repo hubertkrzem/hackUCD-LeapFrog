@@ -89,6 +89,8 @@ struct StatusPill: View {
 
 struct ModeFilterBar: View {
     let model: LiveMapModel
+    /// Inside the bottom menu the bar sits on a grey track instead of its own floating card.
+    var inPanel = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -123,19 +125,24 @@ struct ModeFilterBar: View {
             }
         }
         .padding(5)
-        .card(radius: 30)
+        .background {
+            if inPanel {
+                Capsule().fill(Theme.canvas)
+            } else {
+                Capsule().fill(Theme.surface)
+                    .overlay(Capsule().stroke(Theme.hairline, lineWidth: 0.5))
+                    .shadow(color: Theme.ink.opacity(0.12), radius: 14, y: 6)
+            }
+        }
     }
 }
 
 struct MapControls: View {
-    let onSearch: () -> Void
     let onLocate: () -> Void
     let onHome: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
-            controlButton("magnifyingglass", label: "Search stops", action: onSearch)
-            Divider().frame(width: 28)
             controlButton("location.fill", label: "My location", action: onLocate)
             Divider().frame(width: 28)
             controlButton("building.2.fill", label: "Dublin city centre", action: onHome)
