@@ -71,6 +71,16 @@ nonisolated extension IrishRailClient.Train {
     }
 
     var progress: String? { messageLines.count > 2 ? messageLines[2] : nil }
+
+    /// "Arrived Killiney next stop Dalkey" means standing at Killiney; "Departed ..." means running.
+    var railStatus: RailStatus {
+        let southbound: Bool? = switch direction.lowercased() {
+        case "southbound": true
+        case "northbound": false
+        default: nil
+        }
+        return RailStatus(southbound: southbound, atStation: progress?.hasPrefix("Departed") != true)
+    }
 }
 
 /// Collects the text of each child element of every `recordElement` into a dictionary.
