@@ -44,11 +44,12 @@ struct BottomMenu: View {
     private static let menuTopPadding: CGFloat = 6
     private static let menuBottomPadding: CGFloat = 20
 
-    /// The menu itself is only as tall as its options; Leap Card, Driver Check and
-    /// LeapDigital pages have more to show, so they open at two thirds of the screen.
+    /// The menu is only as tall as its options, and the Leap Card and Driver Check
+    /// pages keep that same height. LeapDigital has much more to show, so it opens
+    /// at two thirds of the screen.
     private var expandedHeight: CGFloat {
         let pageHeight = screenHeight * 2 / 3
-        guard path.isEmpty, menuContentHeight > 0 else { return pageHeight }
+        guard !path.contains(.leapDigital), menuContentHeight > 0 else { return pageHeight }
         let fitted = Self.grabberHeight + Self.menuTopPadding + menuContentHeight + Self.menuBottomPadding + safeArea.bottom
         return min(fitted, pageHeight)
     }
@@ -127,6 +128,8 @@ struct BottomMenu: View {
                 .shadow(color: Theme.ink.opacity(0.14), radius: 16, y: -2)
         )
         .animation(.spring(response: 0.38, dampingFraction: 0.86), value: expandedHeight)
+        // However the menu was closed (swipe, map tap), reopen it on the main options.
+        .onChange(of: detent) { _, new in if new == .collapsed { path = [] } }
         .contentShape(Rectangle())
         .gesture(dragGesture)
     }
@@ -393,8 +396,6 @@ private struct LeapCardView: View {
 
     var body: some View {
         MenuDestinationLayout(
-            symbol: "creditcard.fill",
-            title: "Leap Card",
             intro: "Top up your TFI Leap Card and check your balance and journey history.",
             points: [
                 ("person.crop.circle", "Log in to your Leap account to top up online."),
@@ -413,8 +414,6 @@ private struct DriverCheckView: View {
 
     var body: some View {
         MenuDestinationLayout(
-            symbol: "checkmark.shield.fill",
-            title: "TFI Driver Check",
             intro: "Before you get into a taxi, hackney or limousine, check that the vehicle and driver are licensed.",
             points: [
                 ("car.fill", "Check the vehicle's registration and licence number from its roof or door signs."),
@@ -428,9 +427,9 @@ private struct DriverCheckView: View {
     }
 }
 
+/// A compact page that fits the menu's height: intro, the main action, then details.
+/// The page title is shown in the navigation bar.
 private struct MenuDestinationLayout: View {
-    let symbol: String
-    let title: String
     let intro: String
     let points: [(symbol: String, text: String)]
     let linkTitle: String
@@ -438,43 +437,36 @@ private struct MenuDestinationLayout: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 12) {
-                    Image(systemName: symbol)
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .background(Theme.green, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    Text(title)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(Theme.ink)
-                }
+            VStack(alignment: .leading, spacing: 14) {
                 Text(intro)
+                    .font(.subheadline)
                     .foregroundStyle(Theme.ink)
-                VStack(alignment: .leading, spacing: 12) {
+
+                Link(destination: link) {
+                    Label(linkTitle, systemImage: "arrow.up.right")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .foregroundStyle(.white)
+                        .background(Theme.green, in: Capsule())
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(points, id: \.text) { point in
                         Label {
                             Text(point.text).foregroundStyle(Theme.ink)
                         } icon: {
                             Image(systemName: point.symbol).foregroundStyle(Theme.green)
                         }
-                        .font(.subheadline)
+                        .font(.footnote)
                     }
                 }
-                .padding(14)
+                .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-
-                Link(destination: link) {
-                    Label(linkTitle, systemImage: "arrow.up.right")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 13)
-                        .foregroundStyle(.white)
-                        .background(Theme.green, in: Capsule())
-                }
+                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
         .background(Theme.surface)
         .navigationBarTitleDisplayMode(.inline)
