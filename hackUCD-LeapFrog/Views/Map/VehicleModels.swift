@@ -30,10 +30,9 @@ enum VehicleModelFactory {
         let root = SCNNode()
         let length: CGFloat = 13, width: CGFloat = 2.55, height: CGFloat = 4.3
         root.addChildNode(box(width, height - 0.4, length, chamfer: 0.35, color: busYellow, at: SCNVector3(0, 0.2 + Float(height) / 2, 0)))
-        // Green "hints": lower skirt, a band between the decks and a roof stripe.
+        // Green "hints": lower skirt and a band between the decks.
         root.addChildNode(box(width + 0.04, 0.75, length - 0.2, chamfer: 0.1, color: Theme.greenUI, at: SCNVector3(0, 0.75, 0)))
         root.addChildNode(box(width + 0.04, 0.3, length - 0.3, chamfer: 0.05, color: Theme.greenUI, at: SCNVector3(0, 2.45, 0)))
-        root.addChildNode(box(0.7, 0.04, length - 1.2, chamfer: 0, color: Theme.greenUI, at: SCNVector3(0, Float(height) + 0.2, 0)))
         // Window bands on both decks, plus the windscreen at the front.
         root.addChildNode(box(width + 0.03, 0.9, length - 1.6, chamfer: 0.05, color: glass, at: SCNVector3(0, 1.8, 0.5)))
         root.addChildNode(box(width + 0.03, 0.95, length - 0.9, chamfer: 0.05, color: glass, at: SCNVector3(0, 3.3, 0.1)))
