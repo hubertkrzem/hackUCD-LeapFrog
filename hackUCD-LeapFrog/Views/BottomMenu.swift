@@ -12,11 +12,11 @@ struct BottomMenu: View {
     }
 
     enum Destination: Hashable {
-        case leapCard, driverCheck
+        case leapCard, driverCheck, leapDigital
     }
 
     #if DEBUG
-    /// For screenshots: `-menu collapsed|expanded|searching|leapCard|driverCheck` and `-menuQuery "Tara"`.
+    /// For screenshots: `-menu collapsed|expanded|searching|leapCard|driverCheck|leapDigital` and `-menuQuery "Tara"`.
     private static let launchArgument = UserDefaults.standard.string(forKey: "menu")
     #endif
 
@@ -29,6 +29,7 @@ struct BottomMenu: View {
 
     @State private var query = BottomMenu.launchQuery
     @State private var path = BottomMenu.launchPath
+    @State private var leapDigital = LeapDigitalStore()
     @FocusState private var searchFocused: Bool
     @GestureState private var drag: CGFloat = 0
 
@@ -74,6 +75,7 @@ struct BottomMenu: View {
         switch launchArgument {
         case "leapCard": [.leapCard]
         case "driverCheck": [.driverCheck]
+        case "leapDigital": [.leapDigital]
         default: []
         }
         #else
@@ -165,6 +167,11 @@ struct BottomMenu: View {
                         MenuRow(symbol: "checkmark.shield.fill", title: "TFI Driver Check",
                                 subtitle: "Check a taxi and driver are licensed")
                     }
+                    Divider().padding(.leading, 66)
+                    NavigationLink(value: Destination.leapDigital) {
+                        MenuRow(symbol: "wave.3.right.circle.fill", title: "LeapDigital",
+                                subtitle: "Your Leap Card in Apple Wallet")
+                    }
                 }
                 .buttonStyle(.plain)
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -180,6 +187,7 @@ struct BottomMenu: View {
                 switch destination {
                 case .leapCard: LeapCardView()
                 case .driverCheck: DriverCheckView()
+                case .leapDigital: LeapDigitalView(store: leapDigital)
                 }
             }
         }
@@ -318,7 +326,7 @@ extension BottomMenu.Detent {
     static var launchState: Self {
         #if DEBUG
         switch UserDefaults.standard.string(forKey: "menu") {
-        case "expanded", "leapCard", "driverCheck": return .expanded
+        case "expanded", "leapCard", "driverCheck", "leapDigital": return .expanded
         case "searching": return .searching
         default: return .collapsed
         }
