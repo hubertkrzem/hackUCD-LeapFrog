@@ -1,0 +1,7 @@
+# NTA API key — never commit
+hackUCD-LeapFrog/Secrets.plist
+
+xcuserdata/
+DerivedData/
+.DS_Store
+__pycache__/
