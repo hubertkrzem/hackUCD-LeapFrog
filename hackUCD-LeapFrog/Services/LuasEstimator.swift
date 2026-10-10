@@ -51,15 +51,17 @@ nonisolated enum LuasEstimator {
                   let patternIndex = data.luas.trips[tripId], data.luas.patterns.indices.contains(patternIndex)
             else { continue }
             let pattern = data.luas.patterns[patternIndex]
+            let scheduled = trip.scheduledStart.map { start in pattern.offsets.map { start.addingTimeInterval(TimeInterval($0)) } }
             guard let times = predictedTimes(pattern: pattern, trip: trip, updates: update.stopTimeUpdate ?? []),
-                  let calls = calls(stopIds: pattern.stopIds, times: times, data: data) else { continue }
+                  let calls = calls(stopIds: pattern.stopIds, times: times, scheduled: scheduled, data: data) else { continue }
             result["luas-\(tripId)"] = calls
         }
         return result
     }
 
-    /// A tram's stop-by-stop timeline from one predicted time per stop.
-    static func calls(stopIds: [String], times: [Date], data: StaticData) -> [RailCall]? {
+    /// A tram's stop-by-stop journey from one predicted (and optionally one
+    /// scheduled) time per stop.
+    static func calls(stopIds: [String], times: [Date], scheduled: [Date]? = nil, data: StaticData) -> [RailCall]? {
         guard stopIds.count >= 2, stopIds.count == times.count else { return nil }
         var calls: [RailCall] = []
         for (i, stopId) in stopIds.enumerated() {
@@ -67,11 +69,18 @@ nonisolated enum LuasEstimator {
             // GTFS gives one time per stop; trams leave after a short dwell.
             let next = i + 1 < times.count ? times[i + 1].timeIntervalSince(times[i]) : 0
             let dwell = min(RailTracker.tramDwell, max(next * 0.3, 0))
-            calls.append(RailCall(
+            var call = RailCall(
                 stationId: stopId, latitude: stop.latitude, longitude: stop.longitude,
                 arrival: i == 0 ? nil : times[i],
                 departure: i == stopIds.count - 1 ? nil : times[i].addingTimeInterval(i == 0 ? 0 : dwell)
-            ))
+            )
+            if let scheduled, scheduled.count == stopIds.count {
+                let gap = i + 1 < scheduled.count ? scheduled[i + 1].timeIntervalSince(scheduled[i]) : 0
+                call.scheduledArrival = i == 0 ? nil : scheduled[i]
+                call.scheduledDeparture = i == stopIds.count - 1 ? nil
+                    : scheduled[i].addingTimeInterval(i == 0 ? 0 : min(RailTracker.tramDwell, max(gap * 0.3, 0)))
+            }
+            calls.append(call)
         }
         return calls
     }

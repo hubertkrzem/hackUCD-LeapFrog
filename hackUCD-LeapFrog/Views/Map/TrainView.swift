@@ -118,6 +118,8 @@ final class TrainView: MKAnnotationView {
     static let reuseID = "Train"
     static let maxCars = 6
     static let couplingGap: CGFloat = 0.5
+    /// Sideways shift off the centreline, as a share of a car's on-screen length.
+    static let leftHandOffset: CGFloat = 0.18
 
     private static let elevation = 50 * Double.pi / 180
     private var consist = Consist.dart
@@ -216,10 +218,20 @@ final class TrainView: MKAnnotationView {
         }
         // Keep the whole train on the track at the ends of its path.
         let shift = max(couplings[0] - shape.length, 0) + min(couplings[count], 0)
-        let points = couplings.map { d -> CGPoint in
+        let centreline = couplings.map { d -> CGPoint in
             let p = shape.point(at: d - shift)
             let screen = frame.screen(latitude: p.latitude, longitude: p.longitude)
             return CGPoint(x: screen.x - anchor.x, y: screen.y - anchor.y)
+        }
+        // Luas and Irish Rail run on the left: draw each direction to the left of the
+        // line so trains passing each other sit side by side instead of overlapping.
+        let sideStep = carriagePt * Self.leftHandOffset
+        let points = centreline.indices.map { k -> CGPoint in
+            let ahead = centreline[max(k - 1, 0)], behind = centreline[min(k + 1, centreline.count - 1)]
+            let dx = ahead.x - behind.x, dy = ahead.y - behind.y
+            let length = max(hypot(dx, dy), 0.001)
+            // Left of travel on screen (y points down).
+            return CGPoint(x: centreline[k].x + dy / length * sideStep, y: centreline[k].y - dx / length * sideStep)
         }
 
         let side = carriagePt / consist.spriteFraction
