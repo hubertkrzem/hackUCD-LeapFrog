@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @State private var model = LiveMapModel()
     @State private var menu = BottomMenu.Detent.launchState
+    @State private var showingChat = ChatScreen.opensAtLaunch
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -39,6 +40,9 @@ struct ContentView: View {
             .presentationDragIndicator(.visible)
             .presentationCornerRadius(28)
             .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.38)))
+        }
+        .fullScreenCover(isPresented: $showingChat) {
+            ChatScreen { showingChat = false }
         }
     }
 
@@ -90,9 +94,6 @@ struct ContentView: View {
                         )
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
-                }
-                Spacer()
-                if menu == .collapsed {
                     HStack {
                         Spacer()
                         MapControls(
@@ -100,12 +101,19 @@ struct ContentView: View {
                             onHome: { model.showDublin() }
                         )
                     }
+                }
+                Spacer()
+                if menu == .collapsed {
+                    HStack {
+                        Spacer()
+                        ChatButton { showingChat = true }
+                    }
                     .transition(.opacity)
                 }
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
-            // Keep the controls just above the collapsed menu.
+            // Keep the chat button just above the collapsed menu.
             .padding(.bottom, controlsInset + 12)
             // The keyboard only appears with full-screen search, which covers this layer.
             .ignoresSafeArea(.keyboard)
