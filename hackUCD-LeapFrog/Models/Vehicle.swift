@@ -32,6 +32,8 @@ nonisolated struct Vehicle: Identifiable, Hashable, Sendable {
     var directionId: Int? = nil
     /// Scheduled start of the trip (GTFS-R start_date + start_time), for route-based estimates.
     var tripStart: Date? = nil
+    /// Irish Rail's direction and whether the train is standing at a station.
+    var rail: RailStatus? = nil
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
@@ -44,8 +46,16 @@ nonisolated struct Vehicle: Identifiable, Hashable, Sendable {
         Vehicle(id: id, mode: mode, latitude: estimate.latitude, longitude: estimate.longitude, routeName: routeName,
                 routeDescription: routeDescription, operatorName: operatorName, headsign: headsign,
                 bearing: estimate.bearing, timestamp: timestamp, source: source, tripId: tripId,
-                routeId: routeId, directionId: directionId, tripStart: tripStart)
+                routeId: routeId, directionId: directionId, tripStart: tripStart, rail: rail)
     }
+}
+
+/// What the Irish Rail feed says about a train beyond its position, which is
+/// only ever the last station it arrived at or departed from.
+nonisolated struct RailStatus: Hashable, Sendable {
+    /// Nil when the feed doesn't say.
+    let southbound: Bool?
+    let atStation: Bool
 }
 
 /// A predicted arrival shown in a stop's detail sheet.

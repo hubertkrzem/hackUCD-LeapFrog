@@ -15,6 +15,9 @@ struct TransitMapView: UIViewRepresentable {
     /// Route-based live estimates for buses, refreshed every second.
     let estimatedPositions: [String: BusTracker.Estimate]
     let positionsVersion: Int
+    /// DARTs placed on the track, refreshed with the bus estimates.
+    let trainPlacements: [String: RailTracker.Placement]
+    let railShapes: [RouteShape]
     /// The selected bus's route, drawn while its sheet is open.
     let selectedRoute: (id: String, coordinates: [CLLocationCoordinate2D])?
     let cameraRequest: LiveMapModel.CameraRequest?
@@ -38,6 +41,7 @@ struct TransitMapView: UIViewRepresentable {
         mapView.register(StopDotView.self, forAnnotationViewWithReuseIdentifier: StopDotView.reuseID)
         mapView.register(StopClusterView.self, forAnnotationViewWithReuseIdentifier: StopClusterView.reuseID)
         mapView.register(VehicleMarkerView.self, forAnnotationViewWithReuseIdentifier: VehicleMarkerView.reuseID)
+        mapView.register(TrainView.self, forAnnotationViewWithReuseIdentifier: TrainView.reuseID)
         mapView.register(WatchedStopView.self, forAnnotationViewWithReuseIdentifier: WatchedStopView.reuseID)
         var span = 0.14
         #if DEBUG
@@ -76,6 +80,7 @@ struct TransitMapView: UIViewRepresentable {
         if positionsVersion != coordinator.lastPositionsVersion {
             coordinator.lastPositionsVersion = positionsVersion
             coordinator.applyEstimates(estimatedPositions)
+            coordinator.applyTrainPlacements(trainPlacements)
         }
         coordinator.syncSelectedRoute(selectedRoute)
 
@@ -108,6 +113,12 @@ struct TransitMapView: UIViewRepresentable {
         private var railStops: [String: StopAnnotation] = [:]
         private var busStops: [String: StopAnnotation] = [:]
         private var vehicles: [String: VehicleAnnotation] = [:]
+        private var trains: [String: TrainAnnotation] = [:]
+        private var displayLink: CADisplayLink?
+        private var trainFrameCount = 0
+        #if DEBUG
+        private var frameCost = (total: 0.0, worst: 0.0, frames: 0, laidOut: 0)
+        #endif
         private var watched: WatchedStopAnnotation?
         /// Camera heading the vehicle sprites were last oriented for.
         private var spriteHeading: Double = 0
@@ -186,7 +197,13 @@ struct TransitMapView: UIViewRepresentable {
 
         private func syncMarkers(_ latest: [Vehicle], on mapView: MKMapView) {
             guard let parent else { return }
-            let latestById = Dictionary(latest.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var latestById = Dictionary(latest.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            // Trains on the track are drawn by TrainView instead.
+            for (id, train) in trains {
+                guard let vehicle = latestById.removeValue(forKey: id) else { continue }
+                train.vehicle = vehicle
+                (mapView.view(for: train) as? TrainView)?.configure(with: vehicle, eta: parent.etas[id].map { Self.etaText($0) })
+            }
 
             let gone = vehicles.keys.filter { latestById[$0] == nil }
             if !gone.isEmpty {
@@ -265,6 +282,83 @@ struct TransitMapView: UIViewRepresentable {
             }
         }
 
+        /// Swaps tracked DARTs from plain markers to coupled trains and sets each
+        /// gliding towards its latest placement over the next second.
+        func applyTrainPlacements(_ placements: [String: RailTracker.Placement]) {
+            guard let mapView, let parent else { return }
+            let now = CACurrentMediaTime()
+            let gone = trains.keys.filter { placements[$0] == nil }
+            if !gone.isEmpty {
+                mapView.removeAnnotations(gone.compactMap { trains.removeValue(forKey: $0) })
+            }
+            var added: [TrainAnnotation] = []
+            for (id, placement) in placements where parent.railShapes.indices.contains(placement.shape) {
+                if let train = trains[id] {
+                    train.retarget(placement, now: now)
+                    continue
+                }
+                guard let vehicle = vehicles[id]?.vehicle ?? parent.vehicles.first(where: { $0.id == id }) else { continue }
+                if let marker = vehicles.removeValue(forKey: id) { mapView.removeAnnotation(marker) }
+                let point = parent.railShapes[placement.shape].point(at: placement.distance)
+                let train = TrainAnnotation(vehicle: vehicle, placement: placement,
+                                            coordinate: CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude))
+                trains[id] = train
+                added.append(train)
+            }
+            if !added.isEmpty { mapView.addAnnotations(added) }
+
+            if trains.isEmpty {
+                displayLink?.invalidate()
+                displayLink = nil
+            } else if displayLink == nil {
+                let link = CADisplayLink(target: self, selector: #selector(stepTrains))
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+            }
+        }
+
+        @objc private func stepTrains(_ link: CADisplayLink) {
+            guard let mapView, let parent else { return }
+            #if DEBUG
+            let started = CACurrentMediaTime()
+            var laidOut = 0
+            #endif
+            let now = CACurrentMediaTime()
+            let frame = TrainFrame(mapView: mapView)
+            trainFrameCount += 1
+            // Off-screen trains only need to move often enough for MapKit to notice them arriving.
+            let moveOffscreen = trainFrameCount % 10 == 0
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for train in trains.values {
+                _ = train.step(now: now, duration: 1)
+                let placement = train.placement
+                guard parent.railShapes.indices.contains(placement.shape) else { continue }
+                let shape = parent.railShapes[placement.shape]
+                let point = shape.point(at: train.distance)
+                let coordinate = CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude)
+                // MapKit only has views for trains on screen.
+                let view = mapView.view(for: train) as? TrainView
+                if coordinate != train.coordinate, view != nil || moveOffscreen { train.coordinate = coordinate }
+                if let view, view.layout(distance: train.distance, direction: placement.direction, shape: shape, frame: frame) {
+                    #if DEBUG
+                    laidOut += 1
+                    #endif
+                }
+            }
+            CATransaction.commit()
+            #if DEBUG
+            let cost = CACurrentMediaTime() - started
+            frameCost = (frameCost.total + cost, max(frameCost.worst, cost), frameCost.frames + 1, max(frameCost.laidOut, laidOut))
+            if frameCost.frames == 300 {
+                NSLog(String(format: "[Trains] %d tracked, up to %d laid out · per frame: avg %.3f ms, worst %.3f ms",
+                             trains.count, frameCost.laidOut, frameCost.total / 300 * 1000, frameCost.worst * 1000))
+                frameCost = (0, 0, 0, 0)
+            }
+            #endif
+        }
+
         func syncSelectedRoute(_ route: (id: String, coordinates: [CLLocationCoordinate2D])?) {
             guard let mapView, routeOverlay?.id != route?.id else { return }
             if let routeOverlay { mapView.removeOverlay(routeOverlay.polyline) }
@@ -321,6 +415,14 @@ struct TransitMapView: UIViewRepresentable {
                     configure(view, for: vehicle.vehicle, parent: parent)
                 }
                 return view
+            case let train as TrainAnnotation:
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: TrainView.reuseID, for: train)
+                if let view = view as? TrainView, let parent, parent.railShapes.indices.contains(train.placement.shape) {
+                    view.configure(with: train.vehicle, eta: parent.etas[train.vehicle.id].map { Self.etaText($0) })
+                    view.layout(distance: train.distance, direction: train.placement.direction,
+                                shape: parent.railShapes[train.placement.shape], frame: TrainFrame(mapView: mapView))
+                }
+                return view
             case let watched as WatchedStopAnnotation:
                 return mapView.dequeueReusableAnnotationView(withIdentifier: WatchedStopView.reuseID, for: watched)
             case let stop as StopAnnotation:
@@ -351,6 +453,8 @@ struct TransitMapView: UIViewRepresentable {
             switch annotation {
             case let vehicle as VehicleAnnotation:
                 parent?.onSelect(.vehicle(vehicle.vehicle))
+            case let train as TrainAnnotation:
+                parent?.onSelect(.vehicle(train.vehicle))
             case let watched as WatchedStopAnnotation:
                 parent?.onSelect(.stop(watched.stop))
             case let stop as StopAnnotation:

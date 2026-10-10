@@ -1,8 +1,8 @@
 #if DEBUG
 import Foundation
 
-/// Fake buses for testing the map without an API key. Enable with the launch
-/// argument `-syntheticBuses 300`.
+/// Fake buses and DARTs for testing the map without an API key. Enable with the
+/// launch arguments `-syntheticBuses 300` and/or `-syntheticTrains 14`.
 ///
 /// Buses drive along real Dublin route shapes at their own speeds, dwelling at
 /// "stops", and — like the real NTA feed — report pings every 20 s that are
@@ -26,17 +26,107 @@ nonisolated struct SyntheticFeed: Sendable {
         var tripStart: Date?
     }
 
+    /// Runs station to station like a real DART, but reports only what Irish Rail
+    /// would: the station it last arrived at or departed from.
+    private struct Train: Sendable {
+        let id: String
+        let shape: Int
+        var direction: Double
+        var station: Int
+        /// Standing at `station` until this time, or running away from it since.
+        var dwellUntil: Date?
+        var departedAt: Date?
+    }
+
+    private static let trainDwell: TimeInterval = 30
+    private static let terminusDwell: TimeInterval = 120
+
     let count: Int
+    let trainCount: Int
     private var buses: [Bus] = []
+    private var trains: [Train] = []
     private var lastTick: Date?
 
     static var requestedCount: Int { UserDefaults.standard.integer(forKey: "syntheticBuses") }
+    static var requestedTrains: Int { UserDefaults.standard.integer(forKey: "syntheticTrains") }
 
-    init(count: Int) {
+    init(count: Int, trains: Int = 0) {
         self.count = count
+        trainCount = trains
     }
 
-    mutating func tick(data: StaticData, routes: BusRouteStore, now: Date = .now) -> [Vehicle] {
+    mutating func tick(data: StaticData, routes: BusRouteStore, rail: RailNetwork, now: Date = .now) -> [Vehicle] {
+        tickBuses(data: data, routes: routes, now: now) + tickTrains(rail: rail, now: now)
+    }
+
+    private mutating func tickTrains(rail: RailNetwork, now: Date) -> [Vehicle] {
+        if trains.isEmpty, trainCount > 0 { spawnTrains(rail: rail, now: now) }
+        return trains.indices.compactMap { i in
+            advance(&trains[i], rail: rail, now: now)
+            let train = trains[i]
+            let stations = rail.stations[train.shape]
+            guard stations.indices.contains(train.station) else { return nil }
+            let point = rail.shapes[train.shape].point(at: stations[train.station].distance)
+            let southbound = rail.southSign(shape: train.shape, at: stations[train.station].distance) * train.direction > 0
+            let terminus = rail.terminus(shape: train.shape, direction: train.direction)?.name
+            return Vehicle(
+                id: train.id, mode: .dart, latitude: point.latitude, longitude: point.longitude,
+                routeName: "DART", routeDescription: terminus.map { "Synthetic to \($0)" },
+                operatorName: "Iarnród Éireann / Irish Rail", headsign: terminus, bearing: nil, timestamp: now,
+                source: .irishRail, tripId: train.id,
+                rail: RailStatus(southbound: southbound, atStation: train.dwellUntil != nil)
+            )
+        }
+    }
+
+    private func advance(_ train: inout Train, rail: RailNetwork, now: Date) {
+        let stations = rail.stations[train.shape]
+        while true {
+            if let until = train.dwellUntil {
+                guard now >= until else { return }
+                // Turn round at the end of the line.
+                let next = train.station + Int(train.direction)
+                if !stations.indices.contains(next) { train.direction = -train.direction }
+                train.dwellUntil = nil
+                train.departedAt = until
+            } else if let departed = train.departedAt {
+                let next = train.station + Int(train.direction)
+                guard stations.indices.contains(next) else {
+                    train.dwellUntil = now
+                    continue
+                }
+                let arrival = departed.addingTimeInterval(
+                    RailTracker.runTime(over: abs(stations[next].distance - stations[train.station].distance)))
+                guard now >= arrival else { return }
+                train.station = next
+                train.departedAt = nil
+                let atEnd = !stations.indices.contains(next + Int(train.direction))
+                train.dwellUntil = arrival.addingTimeInterval(atEnd ? Self.terminusDwell : Self.trainDwell)
+            } else {
+                train.dwellUntil = now
+            }
+        }
+    }
+
+    private mutating func spawnTrains(rail: RailNetwork, now: Date) {
+        var generator = SystemRandomNumberGenerator()
+        for index in 0..<trainCount {
+            // Mostly the main line, as on the real network.
+            let shape = index % 4 == 3 ? (rail.mainShape == 0 ? 1 : 0) : rail.mainShape
+            guard rail.shapes.indices.contains(shape), rail.stations[shape].count > 1 else { continue }
+            let station = Int.random(in: 0..<rail.stations[shape].count, using: &generator)
+            let running = Bool.random(using: &generator)
+            trains.append(Train(
+                id: "synthetic-dart-\(index)", shape: shape, direction: Bool.random(using: &generator) ? 1 : -1,
+                station: station,
+                dwellUntil: running ? nil : now.addingTimeInterval(.random(in: 0...Self.trainDwell, using: &generator)),
+                departedAt: running ? now.addingTimeInterval(-.random(in: 0...60, using: &generator)) : nil
+            ))
+        }
+    }
+
+    private mutating func tickBuses(data: StaticData, routes: BusRouteStore, now: Date) -> [Vehicle] {
+        guard count > 0 else { return [] }
         if buses.isEmpty { spawn(routes: routes, now: now) }
         let dt = lastTick.map { now.timeIntervalSince($0) } ?? 0
         lastTick = now
