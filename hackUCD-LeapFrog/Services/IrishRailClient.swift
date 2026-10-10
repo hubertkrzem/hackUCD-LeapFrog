@@ -10,21 +10,93 @@ nonisolated struct IrishRailClient: Sendable {
         let longitude: Double
         let message: String
         let direction: String
+        /// Service date as the API writes it, e.g. "10 Oct 2026"; needed for movements.
+        var date: String = ""
+    }
+
+    /// One row of a train's journey: a station call with its actual times so far
+    /// and Irish Rail's expected times for the rest.
+    struct Movement: Sendable, Equatable {
+        let stationCode: String
+        /// "O" origin, "S" stop, "D" destination; "T" timing points are dropped.
+        let type: String
+        let expectedArrival: Date?
+        let expectedDeparture: Date?
+        let arrival: Date?
+        let departure: Date?
     }
 
     static let url = URL(string: "https://api.irishrail.ie/realtime/realtime.asmx/getCurrentTrainsXML_WithTrainType?TrainType=D")!
+    static let base = "https://api.irishrail.ie/realtime/realtime.asmx/"
 
     var session: URLSession = .shared
 
     @concurrent
     func currentDARTs() async throws -> [Train] {
-        var request = URLRequest(url: Self.url)
+        Self.parse(try await fetch(Self.url))
+    }
+
+    /// Every DART station's coordinates, keyed by station code (e.g. "MHIDE").
+    @concurrent
+    func stations() async throws -> [String: (latitude: Double, longitude: Double)] {
+        let data = try await fetch(URL(string: Self.base + "getAllStationsXML_WithStationType?StationType=D")!)
+        var result: [String: (latitude: Double, longitude: Double)] = [:]
+        for record in XMLRecordParser.parse(data, recordElement: "objStation") {
+            guard let code = record["StationCode"]?.trimmingCharacters(in: .whitespaces),
+                  let lat = record["StationLatitude"].flatMap(Double.init),
+                  let lon = record["StationLongitude"].flatMap(Double.init), lat != 0 else { continue }
+            result[code] = (lat, lon)
+        }
+        return result
+    }
+
+    /// A train's journey so far and ahead.
+    @concurrent
+    func movements(for train: Train) async throws -> [Movement] {
+        var components = URLComponents(string: Self.base + "getTrainMovementsXML")!
+        components.queryItems = [URLQueryItem(name: "TrainId", value: train.code), URLQueryItem(name: "TrainDate", value: train.date)]
+        return Self.parseMovements(try await fetch(components.url!), date: train.date)
+    }
+
+    private func fetch(_ url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
         request.timeoutInterval = 20
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw TransitAPIError.http(http.statusCode)
         }
-        return Self.parse(data)
+        return data
+    }
+
+    static func parseMovements(_ data: Data, date: String) -> [Movement] {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_IE_POSIX")
+        formatter.timeZone = .dublin
+        formatter.dateFormat = "d MMM yyyy"
+        guard let day = formatter.date(from: date) else { return [] }
+        var previous: Date?
+        // "HH:mm:ss" on the service day; "00:00:00" or blank means none. Journeys
+        // past midnight roll into the next day.
+        func time(_ text: String?) -> Date? {
+            guard let text, text != "00:00:00" else { return nil }
+            let parts = text.split(separator: ":").compactMap { Int($0) }
+            guard parts.count == 3 else { return nil }
+            var value = Calendar.dublin.date(bySettingHour: parts[0], minute: parts[1], second: parts[2], of: day)
+            if let v = value, let previous, previous.timeIntervalSince(v) > 6 * 3600 {
+                value = Calendar.dublin.date(byAdding: .day, value: 1, to: v)
+            }
+            if let value { previous = value }
+            return value
+        }
+        return XMLRecordParser.parse(data, recordElement: "objTrainMovements").compactMap { record in
+            guard let code = record["LocationCode"]?.trimmingCharacters(in: .whitespaces), !code.isEmpty,
+                  let type = record["LocationType"], type != "T" else { return nil }
+            return Movement(
+                stationCode: code, type: type,
+                expectedArrival: time(record["ExpectedArrival"]), expectedDeparture: time(record["ExpectedDeparture"]),
+                arrival: time(record["Arrival"]), departure: time(record["Departure"])
+            )
+        }
     }
 
     static func parse(_ data: Data) -> [Train] {
@@ -41,7 +113,22 @@ nonisolated struct IrishRailClient: Sendable {
                 latitude: lat,
                 longitude: lon,
                 message: record["PublicMessage"] ?? "",
-                direction: record["Direction"] ?? ""
+                direction: record["Direction"] ?? "",
+                date: record["TrainDate"] ?? ""
+            )
+        }
+    }
+}
+
+nonisolated extension IrishRailClient.Movement {
+    /// The journey as `RailTracker` calls, using station coordinates from `stations()`.
+    static func calls(_ movements: [Self], stations: [String: (latitude: Double, longitude: Double)]) -> [RailCall] {
+        movements.compactMap { m in
+            guard let station = stations[m.stationCode] else { return nil }
+            return RailCall(
+                stationId: m.stationCode, latitude: station.latitude, longitude: station.longitude,
+                arrival: m.arrival ?? m.expectedArrival, departure: m.departure ?? m.expectedDeparture,
+                hasArrived: m.arrival != nil || m.departure != nil, hasDeparted: m.departure != nil
             )
         }
     }

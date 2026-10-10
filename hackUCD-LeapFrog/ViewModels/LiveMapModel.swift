@@ -61,10 +61,16 @@ final class LiveMapModel {
     private(set) var estimatedPositions: [String: BusTracker.Estimate] = [:]
     private(set) var positionsVersion = 0
     @ObservationIgnored private var tracker: BusTracker?
-    /// Where each DART is on the track, refreshed alongside `estimatedPositions`.
+    /// Where each Luas and DART is on its track, refreshed alongside `estimatedPositions`.
     private(set) var trainPlacements: [String: RailTracker.Placement] = [:]
-    private(set) var railShapes: [RouteShape] = []
+    /// The track each placement's distance is measured along.
+    private(set) var railPaths: [String: RouteShape] = [:]
     @ObservationIgnored private var railTracker: RailTracker?
+    /// Each DART's journey timeline from Irish Rail movements, by vehicle id.
+    @ObservationIgnored private var dartJourneys: [String: (calls: [RailCall], fetchedAt: Date, status: String)] = [:]
+    @ObservationIgnored private var railStations: [String: (latitude: Double, longitude: Double)]?
+    /// Movements are refetched when a train's status changes, and at least this often.
+    static let movementsInterval: TimeInterval = 60
     var enabledModes: Set<TransportMode> = Set(TransportMode.allCases) {
         didSet { recomputeDisplayed() }
     }
@@ -93,8 +99,9 @@ final class LiveMapModel {
     private var nextIrishRailAt: Date = .distantPast
     private var filterGeneration = 0
     #if DEBUG
-    private var synthetic: SyntheticFeed? = SyntheticFeed.requestedCount > 0 || SyntheticFeed.requestedTrains > 0
-        ? SyntheticFeed(count: SyntheticFeed.requestedCount, trains: SyntheticFeed.requestedTrains) : nil
+    private var synthetic: SyntheticFeed? = SyntheticFeed.isRequested
+        ? SyntheticFeed(count: SyntheticFeed.requestedCount, trains: SyntheticFeed.requestedTrains,
+                        trams: SyntheticFeed.requestedTrams) : nil
     #endif
 
     init(apiKey: String? = Secrets.ntaAPIKey) {
@@ -171,7 +178,20 @@ final class LiveMapModel {
 
     /// Snaps buses to their routes and moves each to its estimated position now.
     private func trackBuses(_ merged: [Vehicle]) -> [Vehicle] {
-        railTracker?.ingest(merged)
+        if let railTracker {
+            var calls = LuasEstimator.calls(tripUpdates: tripUpdates?.entity?.compactMap(\.tripUpdate) ?? [], data: data)
+            var fetchedAt: [String: Date] = [:]
+            for (id, journey) in dartJourneys {
+                calls[id] = journey.calls
+                fetchedAt[id] = journey.fetchedAt
+            }
+            #if DEBUG
+            if let synthetic {
+                for (id, journey) in synthetic.railCalls { calls[id] = journey }
+            }
+            #endif
+            railTracker.ingest(merged, calls: calls, fetchedAt: fetchedAt)
+        }
         guard let tracker else { return merged }
         tracker.ingest(merged.filter { $0.source == .nta })
         #if DEBUG
@@ -189,12 +209,13 @@ final class LiveMapModel {
                 var positions: [String: BusTracker.Estimate] = [:]
                 var placements: [String: RailTracker.Placement] = [:]
                 for vehicle in displayedVehicles {
-                    switch vehicle.mode {
-                    case .bus: positions[vehicle.id] = tracker?.estimate(for: vehicle.id)
-                    case .dart: placements[vehicle.id] = railTracker?.placement(for: vehicle.id)
-                    case .luas: break
+                    if vehicle.mode == .bus {
+                        positions[vehicle.id] = tracker?.estimate(for: vehicle.id)
+                    } else {
+                        placements[vehicle.id] = railTracker?.placement(for: vehicle.id)
                     }
                 }
+                if let shapes = railTracker?.pathShapes, shapes.count != railPaths.count { railPaths = shapes }
                 estimatedPositions = positions
                 trainPlacements = placements
                 positionsVersion += 1
@@ -234,9 +255,7 @@ final class LiveMapModel {
             tracker = BusTracker(store: store)
         }
         if railTracker == nil {
-            let network = RailNetwork(data: data)
-            railTracker = RailTracker(network: network)
-            railShapes = network.shapes
+            railTracker = RailTracker(data: data)
         }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.pollFeeds() }
@@ -286,7 +305,10 @@ final class LiveMapModel {
             nextTripUpdatesAt = Self.nextAttempt(after: tripFeed, interval: Self.tripUpdatesInterval, now: now)
         }
         if let rail {
-            if case .success(let trains) = rail { lastRailTrains = trains }
+            if case .success(let trains) = rail {
+                lastRailTrains = trains
+                await refreshJourneys(for: trains, now: now)
+            }
             nextIrishRailAt = Self.nextAttempt(after: rail, interval: Self.irishRailInterval, now: now)
         }
 
@@ -302,6 +324,32 @@ final class LiveMapModel {
             setVehicles(trackBuses(merged))
         }
         updateStatus(vehicleError: vehicleFeed?.failure, railError: rail?.failure, now: now)
+    }
+
+    /// Fetches the movements of every running DART whose status changed since its
+    /// last fetch (it arrived or departed somewhere), or whose timeline is getting old.
+    private func refreshJourneys(for trains: [IrishRailClient.Train], now: Date) async {
+        if railStations == nil { railStations = try? await irishRail.stations() }
+        guard let stations = railStations else { return }
+        let running = trains.filter(\.isRunning)
+        let due = running.filter { train in
+            guard let journey = dartJourneys["ir-\(train.code)"] else { return true }
+            return journey.status != train.message || now.timeIntervalSince(journey.fetchedAt) > Self.movementsInterval
+        }
+        let client = irishRail
+        let fetched = await withTaskGroup(of: (IrishRailClient.Train, [IrishRailClient.Movement]?).self) { group in
+            for train in due {
+                group.addTask { (train, try? await client.movements(for: train)) }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+        for (train, movements) in fetched {
+            guard let movements else { continue }
+            let calls = IrishRailClient.Movement.calls(movements, stations: stations)
+            dartJourneys["ir-\(train.code)"] = calls.count >= 2 ? (calls, now, train.message) : nil
+        }
+        let live = Set(running.map { "ir-\($0.code)" })
+        dartJourneys = dartJourneys.filter { live.contains($0.key) }
     }
 
     /// Success → the normal interval; 429 → exactly when the API says; other errors → retry soon.

@@ -15,9 +15,10 @@ struct TransitMapView: UIViewRepresentable {
     /// Route-based live estimates for buses, refreshed every second.
     let estimatedPositions: [String: BusTracker.Estimate]
     let positionsVersion: Int
-    /// DARTs placed on the track, refreshed with the bus estimates.
+    /// Luas and DARTs placed on their track, refreshed with the bus estimates.
     let trainPlacements: [String: RailTracker.Placement]
-    let railShapes: [RouteShape]
+    /// The path each placement is measured along, by key.
+    let railPaths: [String: RouteShape]
     /// The selected bus's route, drawn while its sheet is open.
     let selectedRoute: (id: String, coordinates: [CLLocationCoordinate2D])?
     let cameraRequest: LiveMapModel.CameraRequest?
@@ -282,7 +283,7 @@ struct TransitMapView: UIViewRepresentable {
             }
         }
 
-        /// Swaps tracked DARTs from plain markers to coupled trains and sets each
+        /// Swaps tracked Luas and DARTs from plain markers to coupled trains and sets each
         /// gliding towards its latest placement over the next second.
         func applyTrainPlacements(_ placements: [String: RailTracker.Placement]) {
             guard let mapView, let parent else { return }
@@ -292,14 +293,15 @@ struct TransitMapView: UIViewRepresentable {
                 mapView.removeAnnotations(gone.compactMap { trains.removeValue(forKey: $0) })
             }
             var added: [TrainAnnotation] = []
-            for (id, placement) in placements where parent.railShapes.indices.contains(placement.shape) {
+            for (id, placement) in placements {
+                guard let path = parent.railPaths[placement.pathKey] else { continue }
                 if let train = trains[id] {
                     train.retarget(placement, now: now)
                     continue
                 }
                 guard let vehicle = vehicles[id]?.vehicle ?? parent.vehicles.first(where: { $0.id == id }) else { continue }
                 if let marker = vehicles.removeValue(forKey: id) { mapView.removeAnnotation(marker) }
-                let point = parent.railShapes[placement.shape].point(at: placement.distance)
+                let point = path.point(at: placement.distance)
                 let train = TrainAnnotation(vehicle: vehicle, placement: placement,
                                             coordinate: CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude))
                 trains[id] = train
@@ -334,14 +336,13 @@ struct TransitMapView: UIViewRepresentable {
             for train in trains.values {
                 _ = train.step(now: now, duration: 1)
                 let placement = train.placement
-                guard parent.railShapes.indices.contains(placement.shape) else { continue }
-                let shape = parent.railShapes[placement.shape]
+                guard let shape = parent.railPaths[placement.pathKey] else { continue }
                 let point = shape.point(at: train.distance)
                 let coordinate = CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude)
                 // MapKit only has views for trains on screen.
                 let view = mapView.view(for: train) as? TrainView
                 if coordinate != train.coordinate, view != nil || moveOffscreen { train.coordinate = coordinate }
-                if let view, view.layout(distance: train.distance, direction: placement.direction, shape: shape, frame: frame) {
+                if let view, view.layout(distance: train.distance, shape: shape, frame: frame) {
                     #if DEBUG
                     laidOut += 1
                     #endif
@@ -417,10 +418,9 @@ struct TransitMapView: UIViewRepresentable {
                 return view
             case let train as TrainAnnotation:
                 let view = mapView.dequeueReusableAnnotationView(withIdentifier: TrainView.reuseID, for: train)
-                if let view = view as? TrainView, let parent, parent.railShapes.indices.contains(train.placement.shape) {
+                if let view = view as? TrainView, let parent, let shape = parent.railPaths[train.placement.pathKey] {
                     view.configure(with: train.vehicle, eta: parent.etas[train.vehicle.id].map { Self.etaText($0) })
-                    view.layout(distance: train.distance, direction: train.placement.direction,
-                                shape: parent.railShapes[train.placement.shape], frame: TrainFrame(mapView: mapView))
+                    view.layout(distance: train.distance, shape: shape, frame: TrainFrame(mapView: mapView))
                 }
                 return view
             case let watched as WatchedStopAnnotation:

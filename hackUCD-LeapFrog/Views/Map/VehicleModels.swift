@@ -21,6 +21,8 @@ enum VehicleModelFactory {
         case .vehicle(.dart): dart()
         case .vehicle(.luas): luas()
         case .dartCar: dartCar()
+        case .luasCab: luasSection(cab: true)
+        case .luasMiddle: luasSection(cab: false)
         }
         // Toy-like proportions: true widths read as slivers at map scale.
         let wrapper = SCNNode()
@@ -102,27 +104,61 @@ enum VehicleModelFactory {
         return wrapper
     }
 
-    /// A three-section Luas tram: silver-grey body with purple skirt and cab ends.
+    /// Luas section length; a tram on the map is cab + middle + cab.
+    static let luasSectionLength: Float = 8
+
+    /// One section of a Citadis-style Luas: silver-grey body, purple skirt, long
+    /// windows. A cab section has a purple nose with a wraparound windscreen at
+    /// the front (-Z); a middle section carries the pantograph. Dark bellows at
+    /// the joints make sections read as one articulated tram.
+    private static func luasSection(cab: Bool) -> SCNNode {
+        let root = SCNNode()
+        let length = CGFloat(luasSectionLength), width: CGFloat = 2.4, height: CGFloat = 3.3
+        let half = luasSectionLength / 2
+        let bodyLength = length - (cab ? 1.0 : 0.6), bodyZ: Float = cab ? 0.5 : 0
+        root.addChildNode(box(width, height - 0.3, bodyLength, chamfer: 0.3, color: luasGrey,
+                              at: SCNVector3(0, 0.15 + Float(height - 0.3) / 2 + 0.15, bodyZ)))
+        root.addChildNode(box(width + 0.04, 0.55, bodyLength - 0.1, chamfer: 0.1, color: TransportMode.luas.tintUI, at: SCNVector3(0, 0.6, bodyZ)))
+        root.addChildNode(box(width + 0.03, 1.15, bodyLength - 1.0, chamfer: 0.05, color: glass, at: SCNVector3(0, 1.95, bodyZ)))
+        for z: Float in [bodyZ - 1.4, bodyZ + 1.4] {
+            root.addChildNode(box(width + 0.06, 1.15, 0.22, chamfer: 0, color: luasGrey, at: SCNVector3(0, 1.95, z)))
+        }
+        root.addChildNode(box(width - 0.4, 0.15, bodyLength - 0.6, chamfer: 0.07, color: roofGrey, at: SCNVector3(0, Float(height) + 0.05, bodyZ)))
+        if cab {
+            let noseZ = -half + 0.5
+            root.addChildNode(box(width - 0.05, 1.3, 1.0, chamfer: 0.35, color: TransportMode.luas.tintUI, at: SCNVector3(0, 0.95, noseZ)))
+            let screen = box(width - 0.2, 1.4, 0.55, chamfer: 0.2, color: glass, at: SCNVector3(0, 2.25, noseZ + 0.1))
+            screen.eulerAngles.x = -0.25
+            root.addChildNode(screen)
+            root.addChildNode(box(width - 0.15, 0.45, 1.0, chamfer: 0.2, color: TransportMode.luas.tintUI, at: SCNVector3(0, Float(height) - 0.15, noseZ + 0.15)))
+            for x: Float in [-0.8, 0.8] {
+                root.addChildNode(box(0.35, 0.18, 0.08, chamfer: 0, color: .white, at: SCNVector3(x, 0.8, -half - 0.02)))
+            }
+        } else {
+            // Pantograph: a dark frame on the roof.
+            root.addChildNode(box(1.3, 0.12, 0.5, chamfer: 0, color: glass, at: SCNVector3(0, Float(height) + 0.2, 0)))
+            root.addChildNode(box(0.1, 0.5, 1.2, chamfer: 0, color: glass, at: SCNVector3(0, Float(height) + 0.45, 0)))
+            root.addChildNode(box(1.6, 0.08, 0.15, chamfer: 0, color: glass, at: SCNVector3(0, Float(height) + 0.72, 0)))
+            root.addChildNode(box(1.8, 2.4, 0.4, chamfer: 0.1, color: roofDark, at: SCNVector3(0, 1.7, -half - 0.05)))
+        }
+        root.addChildNode(box(1.8, 2.4, 0.4, chamfer: 0.1, color: roofDark, at: SCNVector3(0, 1.7, half + 0.05)))
+        addWheels(to: root, width: width, axles: [0])
+        return root
+    }
+
+    /// A three-section Luas tram, for trams that can't be placed on the track.
     private static func luas() -> SCNNode {
         let root = SCNNode()
-        let section: CGFloat = 5.6, width: CGFloat = 2.4, height: CGFloat = 3.3, gap: Float = 0.25
-        for index in 0..<3 {
-            let z = Float(index - 1) * (Float(section) + gap)
-            root.addChildNode(box(width, height - 0.3, section, chamfer: 0.3, color: luasGrey, at: SCNVector3(0, 0.15 + Float(height - 0.3) / 2 + 0.15, z)))
-            root.addChildNode(box(width + 0.04, 0.55, section - 0.2, chamfer: 0.1, color: TransportMode.luas.tintUI, at: SCNVector3(0, 0.6, z)))
-            root.addChildNode(box(width + 0.03, 1.1, section - 1.2, chamfer: 0.05, color: glass, at: SCNVector3(0, 1.95, z)))
-            root.addChildNode(box(width - 0.4, 0.15, section - 0.6, chamfer: 0.07, color: roofGrey, at: SCNVector3(0, Float(height) + 0.05, z)))
-            if index != 1 {
-                // Purple cab ends with a wraparound windscreen.
-                let endZ = z + (index == 0 ? -1 : 1) * (Float(section) / 2 + 0.02)
-                root.addChildNode(box(width - 0.1, 1.2, 0.08, chamfer: 0, color: TransportMode.luas.tintUI, at: SCNVector3(0, 1.0, endZ)))
-                root.addChildNode(box(width - 0.3, 1.2, 0.08, chamfer: 0, color: glass, at: SCNVector3(0, 2.2, endZ)))
-            } else {
-                // Pantograph on the middle section.
-                root.addChildNode(box(1.4, 0.35, 0.12, chamfer: 0, color: glass, at: SCNVector3(0, Float(height) + 0.3, z)))
-            }
+        let sections = [luasSection(cab: true), luasSection(cab: false), luasSection(cab: true)]
+        for (index, section) in sections.enumerated() {
+            section.position.z = Float(index - 1) * (luasSectionLength + 0.15)
+            if index == 2 { section.eulerAngles.y = .pi }
+            root.addChildNode(section)
         }
-        return root
+        root.scale = SCNVector3(0.8, 0.8, 0.8)
+        let wrapper = SCNNode()
+        wrapper.addChildNode(root)
+        return wrapper
     }
 
     private static func box(_ width: CGFloat, _ height: CGFloat, _ length: CGFloat,
@@ -261,10 +297,12 @@ enum VehicleSpriteRenderer {
     }
 }
 
-/// What a sprite shows: a whole vehicle, or one DART carriage.
+/// What a sprite shows: a whole vehicle, or one carriage/section of a train or tram.
 enum SpriteModel: Hashable {
     case vehicle(TransportMode)
     case dartCar
+    case luasCab
+    case luasMiddle
 
     /// Half the height of the camera's view, in model units.
     var orthographicScale: Double {
@@ -272,6 +310,16 @@ enum SpriteModel: Hashable {
         case .vehicle: 10
         // Tight on one carriage, with room for it at any angle.
         case .dartCar: 7.5
+        case .luasCab, .luasMiddle: 5.5
+        }
+    }
+
+    /// Length of one carriage or section along the track, in model units.
+    var carLength: Double {
+        switch self {
+        case .vehicle: 0
+        case .dartCar: Double(VehicleModelFactory.dartCarLength)
+        case .luasCab, .luasMiddle: Double(VehicleModelFactory.luasSectionLength)
         }
     }
 }

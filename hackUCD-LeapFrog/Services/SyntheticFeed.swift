@@ -1,8 +1,9 @@
 #if DEBUG
 import Foundation
 
-/// Fake buses and DARTs for testing the map without an API key. Enable with the
-/// launch arguments `-syntheticBuses 300` and/or `-syntheticTrains 14`.
+/// Fake buses, DARTs and Luas trams for testing the map without an API key. Enable
+/// with the launch arguments `-syntheticBuses 300`, `-syntheticTrains 14` and/or
+/// `-syntheticTrams 20`.
 ///
 /// Buses drive along real Dublin route shapes at their own speeds, dwelling at
 /// "stops", and — like the real NTA feed — report pings every 20 s that are
@@ -26,16 +27,30 @@ nonisolated struct SyntheticFeed: Sendable {
         var tripStart: Date?
     }
 
-    /// Runs station to station like a real DART, but reports only what Irish Rail
-    /// would: the station it last arrived at or departed from.
+    /// Runs station to station like a real DART and reports what Irish Rail would:
+    /// the station it last arrived at or departed from, plus movements (actual
+    /// times so far, nominal expected times ahead). Each train runs at its own
+    /// pace, so the expected times drift from reality like real ones do.
     private struct Train: Sendable {
         let id: String
         let shape: Int
         var direction: Double
         var station: Int
+        /// Real run times are the nominal ones times this.
+        let pace: Double
+        var arrivedAt: Date
         /// Standing at `station` until this time, or running away from it since.
         var dwellUntil: Date?
         var departedAt: Date?
+    }
+
+    /// A Luas trip whose predicted stop times wander a little every ping, like
+    /// GTFS-R TripUpdates.
+    private struct Tram: Sendable {
+        let id: String
+        var pattern: Int
+        var start: Date
+        var delay: TimeInterval
     }
 
     private static let trainDwell: TimeInterval = 30
@@ -43,20 +58,67 @@ nonisolated struct SyntheticFeed: Sendable {
 
     let count: Int
     let trainCount: Int
+    let tramCount: Int
     private var buses: [Bus] = []
     private var trains: [Train] = []
+    private var trams: [Tram] = []
     private var lastTick: Date?
+    /// Each rail vehicle's journey timeline, as `RailTracker` takes it.
+    private(set) var railCalls: [String: [RailCall]] = [:]
 
     static var requestedCount: Int { UserDefaults.standard.integer(forKey: "syntheticBuses") }
     static var requestedTrains: Int { UserDefaults.standard.integer(forKey: "syntheticTrains") }
+    static var requestedTrams: Int { UserDefaults.standard.integer(forKey: "syntheticTrams") }
+    static var isRequested: Bool { requestedCount > 0 || requestedTrains > 0 || requestedTrams > 0 }
 
-    init(count: Int, trains: Int = 0) {
+    init(count: Int, trains: Int = 0, trams: Int = 0) {
         self.count = count
         trainCount = trains
+        tramCount = trams
     }
 
     mutating func tick(data: StaticData, routes: BusRouteStore, rail: RailNetwork, now: Date = .now) -> [Vehicle] {
-        tickBuses(data: data, routes: routes, now: now) + tickTrains(rail: rail, now: now)
+        railCalls = [:]
+        return tickBuses(data: data, routes: routes, now: now) + tickTrains(rail: rail, now: now) + tickTrams(data: data, now: now)
+    }
+
+    private mutating func tickTrams(data: StaticData, now: Date) -> [Vehicle] {
+        let patterns = data.luas.patterns
+        guard tramCount > 0, !patterns.isEmpty else { return [] }
+        var generator = SystemRandomNumberGenerator()
+        if trams.isEmpty {
+            for index in 0..<tramCount {
+                let pattern = Int.random(in: 0..<patterns.count, using: &generator)
+                let length = TimeInterval(patterns[pattern].offsets.last ?? 0)
+                trams.append(Tram(id: "luas-synthetic-\(index)", pattern: pattern,
+                                  start: now.addingTimeInterval(-.random(in: 0...max(length, 1), using: &generator)), delay: 0))
+            }
+        }
+        return trams.indices.compactMap { i in
+            var tram = trams[i]
+            // Start a fresh trip once this one has run its course.
+            if now.timeIntervalSince(tram.start) - tram.delay > TimeInterval(patterns[tram.pattern].offsets.last ?? 0) {
+                tram.pattern = Int.random(in: 0..<patterns.count, using: &generator)
+                tram.start = now
+                tram.delay = 0
+            }
+            tram.delay = min(max(tram.delay + .random(in: -10...14, using: &generator), -30), 240)
+            trams[i] = tram
+            let pattern = patterns[tram.pattern]
+            let times = pattern.offsets.map { tram.start.addingTimeInterval(TimeInterval($0) + tram.delay) }
+            guard let calls = LuasEstimator.calls(stopIds: pattern.stopIds, times: times, data: data),
+                  let position = LuasEstimator.position(at: now, times: times, stopIds: pattern.stopIds, data: data)
+            else { return nil }
+            railCalls[tram.id] = calls
+            let route = data.routes[pattern.routeId]
+            let destination = pattern.stopIds.last.flatMap { data.stopsById[$0]?.name }
+            return Vehicle(
+                id: tram.id, mode: .luas, latitude: position.latitude, longitude: position.longitude,
+                routeName: route?.shortName ?? "Luas", routeDescription: route?.longName, operatorName: route?.operatorName,
+                headsign: destination, bearing: position.bearing, timestamp: now, source: .luasEstimate,
+                tripId: tram.id, routeId: pattern.routeId
+            )
+        }
     }
 
     private mutating func tickTrains(rail: RailNetwork, now: Date) -> [Vehicle] {
@@ -69,6 +131,7 @@ nonisolated struct SyntheticFeed: Sendable {
             let point = rail.shapes[train.shape].point(at: stations[train.station].distance)
             let southbound = rail.southSign(shape: train.shape, at: stations[train.station].distance) * train.direction > 0
             let terminus = rail.terminus(shape: train.shape, direction: train.direction)?.name
+            railCalls[train.id] = journey(of: train, rail: rail)
             return Vehicle(
                 id: train.id, mode: .dart, latitude: point.latitude, longitude: point.longitude,
                 routeName: "DART", routeDescription: terminus.map { "Synthetic to \($0)" },
@@ -77,6 +140,45 @@ nonisolated struct SyntheticFeed: Sendable {
                 rail: RailStatus(southbound: southbound, atStation: train.dwellUntil != nil)
             )
         }
+    }
+
+    /// Irish-Rail-style movements: the current station with its actual times, then
+    /// nominal expected times to the end of the line.
+    private func journey(of train: Train, rail: RailNetwork) -> [RailCall] {
+        let stations = rail.stations[train.shape]
+        let line = rail.shapes[train.shape]
+        var direction = train.direction
+        // About to turn round at the end of the line.
+        if train.dwellUntil != nil, !stations.indices.contains(train.station + Int(direction)) { direction = -direction }
+        func call(_ index: Int) -> RailCall {
+            let point = line.point(at: stations[index].distance)
+            return RailCall(stationId: "syn\(train.shape)-\(index)", latitude: point.latitude, longitude: point.longitude)
+        }
+        var here = call(train.station)
+        here.arrival = train.arrivedAt
+        here.hasArrived = true
+        if let departed = train.departedAt {
+            here.departure = departed
+            here.hasDeparted = true
+        } else {
+            here.departure = train.arrivedAt.addingTimeInterval(Self.trainDwell)
+        }
+        var calls = [here]
+        var clock = here.departure!
+        var index = train.station
+        while stations.indices.contains(index + Int(direction)) {
+            let next = index + Int(direction)
+            clock = clock.addingTimeInterval(RailTracker.runTime(over: abs(stations[next].distance - stations[index].distance)))
+            var stop = call(next)
+            stop.arrival = clock
+            if stations.indices.contains(next + Int(direction)) {
+                clock = clock.addingTimeInterval(Self.trainDwell)
+                stop.departure = clock
+            }
+            calls.append(stop)
+            index = next
+        }
+        return calls
     }
 
     private func advance(_ train: inout Train, rail: RailNetwork, now: Date) {
@@ -96,13 +198,15 @@ nonisolated struct SyntheticFeed: Sendable {
                     continue
                 }
                 let arrival = departed.addingTimeInterval(
-                    RailTracker.runTime(over: abs(stations[next].distance - stations[train.station].distance)))
+                    train.pace * RailTracker.runTime(over: abs(stations[next].distance - stations[train.station].distance)))
                 guard now >= arrival else { return }
                 train.station = next
+                train.arrivedAt = arrival
                 train.departedAt = nil
                 let atEnd = !stations.indices.contains(next + Int(train.direction))
                 train.dwellUntil = arrival.addingTimeInterval(atEnd ? Self.terminusDwell : Self.trainDwell)
             } else {
+                train.arrivedAt = now
                 train.dwellUntil = now
             }
         }
@@ -118,7 +222,8 @@ nonisolated struct SyntheticFeed: Sendable {
             let running = Bool.random(using: &generator)
             trains.append(Train(
                 id: "synthetic-dart-\(index)", shape: shape, direction: Bool.random(using: &generator) ? 1 : -1,
-                station: station,
+                station: station, pace: .random(in: 0.85...1.15, using: &generator),
+                arrivedAt: now.addingTimeInterval(-90),
                 dwellUntil: running ? nil : now.addingTimeInterval(.random(in: 0...Self.trainDwell, using: &generator)),
                 departedAt: running ? now.addingTimeInterval(-.random(in: 0...60, using: &generator)) : nil
             ))
