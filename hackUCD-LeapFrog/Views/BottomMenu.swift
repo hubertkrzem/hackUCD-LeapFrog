@@ -470,5 +470,8 @@ private struct MenuDestinationLayout: View {
         }
         .background(Theme.surface)
         .navigationBarTitleDisplayMode(.inline)
+        // Solid white bar: no translucent blur of the content scrolling underneath.
+        .toolbarBackground(Theme.surface, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
     }
 }

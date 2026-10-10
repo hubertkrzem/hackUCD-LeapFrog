@@ -21,6 +21,9 @@ struct LeapDigitalView: View {
         .background(Theme.surface)
         .navigationTitle("LeapDigital")
         .navigationBarTitleDisplayMode(.inline)
+        // Solid white bar: no translucent blur of the content scrolling underneath.
+        .toolbarBackground(Theme.surface, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
     }
 }
 
