@@ -20,6 +20,8 @@ nonisolated struct IrishRailClient: Sendable {
         let stationCode: String
         /// "O" origin, "S" stop, "D" destination; "T" timing points are dropped.
         let type: String
+        let scheduledArrival: Date?
+        let scheduledDeparture: Date?
         let expectedArrival: Date?
         let expectedDeparture: Date?
         let arrival: Date?
@@ -93,6 +95,7 @@ nonisolated struct IrishRailClient: Sendable {
                   let type = record["LocationType"], type != "T" else { return nil }
             return Movement(
                 stationCode: code, type: type,
+                scheduledArrival: time(record["ScheduledArrival"]), scheduledDeparture: time(record["ScheduledDeparture"]),
                 expectedArrival: time(record["ExpectedArrival"]), expectedDeparture: time(record["ExpectedDeparture"]),
                 arrival: time(record["Arrival"]), departure: time(record["Departure"])
             )
@@ -128,7 +131,8 @@ nonisolated extension IrishRailClient.Movement {
             return RailCall(
                 stationId: m.stationCode, latitude: station.latitude, longitude: station.longitude,
                 arrival: m.arrival ?? m.expectedArrival, departure: m.departure ?? m.expectedDeparture,
-                hasArrived: m.arrival != nil || m.departure != nil, hasDeparted: m.departure != nil
+                hasArrived: m.arrival != nil || m.departure != nil, hasDeparted: m.departure != nil,
+                scheduledArrival: m.scheduledArrival, scheduledDeparture: m.scheduledDeparture
             )
         }
     }
