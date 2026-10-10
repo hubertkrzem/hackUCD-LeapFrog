@@ -32,12 +32,26 @@ struct BottomMenu: View {
     @State private var leapDigital = LeapDigitalStore()
     @FocusState private var searchFocused: Bool
     @GestureState private var drag: CGFloat = 0
+    /// Measured height of the menu options (search bar + rows), so the panel fits them exactly.
+    @State private var menuContentHeight: CGFloat = 0
 
     /// Grabber, hint and filter bar; the bottom safe area is added on top.
     static let collapsedContentHeight: CGFloat = 118
 
     var collapsedHeight: CGFloat { Self.collapsedContentHeight + safeArea.bottom }
-    private var expandedHeight: CGFloat { screenHeight * 2 / 3 }
+    /// Grabber above the expanded content, and breathing room below it (above the home indicator).
+    private static let grabberHeight: CGFloat = 17
+    private static let menuTopPadding: CGFloat = 6
+    private static let menuBottomPadding: CGFloat = 20
+
+    /// The menu itself is only as tall as its options; Leap Card, Driver Check and
+    /// LeapDigital pages have more to show, so they open at two thirds of the screen.
+    private var expandedHeight: CGFloat {
+        let pageHeight = screenHeight * 2 / 3
+        guard path.isEmpty, menuContentHeight > 0 else { return pageHeight }
+        let fitted = Self.grabberHeight + Self.menuTopPadding + menuContentHeight + Self.menuBottomPadding + safeArea.bottom
+        return min(fitted, pageHeight)
+    }
 
     private var height: CGFloat {
         let resting = detent == .collapsed ? collapsedHeight : expandedHeight
@@ -112,6 +126,7 @@ struct BottomMenu: View {
                 .fill(Theme.surface)
                 .shadow(color: Theme.ink.opacity(0.14), radius: 16, y: -2)
         )
+        .animation(.spring(response: 0.38, dampingFraction: 0.86), value: expandedHeight)
         .contentShape(Rectangle())
         .gesture(dragGesture)
     }
@@ -175,11 +190,10 @@ struct BottomMenu: View {
                 }
                 .buttonStyle(.plain)
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-
-                Spacer(minLength: 0)
             }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { menuContentHeight = $0 }
             .padding(.horizontal, 16)
-            .padding(.top, 6)
+            .padding(.top, Self.menuTopPadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(Theme.surface)
             .toolbar(.hidden, for: .navigationBar)
