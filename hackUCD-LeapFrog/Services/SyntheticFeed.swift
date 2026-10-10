@@ -105,8 +105,9 @@ nonisolated struct SyntheticFeed: Sendable {
             tram.delay = min(max(tram.delay + .random(in: -10...14, using: &generator), -30), 240)
             trams[i] = tram
             let pattern = patterns[tram.pattern]
-            let times = pattern.offsets.map { tram.start.addingTimeInterval(TimeInterval($0) + tram.delay) }
-            guard let calls = LuasEstimator.calls(stopIds: pattern.stopIds, times: times, data: data),
+            let scheduled = pattern.offsets.map { tram.start.addingTimeInterval(TimeInterval($0)) }
+            let times = scheduled.map { $0.addingTimeInterval(tram.delay) }
+            guard let calls = LuasEstimator.calls(stopIds: pattern.stopIds, times: times, scheduled: scheduled, data: data),
                   let position = LuasEstimator.position(at: now, times: times, stopIds: pattern.stopIds, data: data)
             else { return nil }
             railCalls[tram.id] = calls
@@ -154,14 +155,17 @@ nonisolated struct SyntheticFeed: Sendable {
             let point = line.point(at: stations[index].distance)
             return RailCall(stationId: "syn\(train.shape)-\(index)", latitude: point.latitude, longitude: point.longitude)
         }
+        // The timetable is the nominal pace; actual times drift from it with each train's pace.
         var here = call(train.station)
         here.arrival = train.arrivedAt
+        here.scheduledArrival = train.arrivedAt
         here.hasArrived = true
+        here.scheduledDeparture = train.arrivedAt.addingTimeInterval(Self.trainDwell)
         if let departed = train.departedAt {
             here.departure = departed
             here.hasDeparted = true
         } else {
-            here.departure = train.arrivedAt.addingTimeInterval(Self.trainDwell)
+            here.departure = here.scheduledDeparture
         }
         var calls = [here]
         var clock = here.departure!
@@ -171,9 +175,11 @@ nonisolated struct SyntheticFeed: Sendable {
             clock = clock.addingTimeInterval(RailTracker.runTime(over: abs(stations[next].distance - stations[index].distance)))
             var stop = call(next)
             stop.arrival = clock
+            stop.scheduledArrival = clock
             if stations.indices.contains(next + Int(direction)) {
                 clock = clock.addingTimeInterval(Self.trainDwell)
                 stop.departure = clock
+                stop.scheduledDeparture = clock
             }
             calls.append(stop)
             index = next

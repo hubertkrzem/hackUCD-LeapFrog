@@ -3,13 +3,14 @@ import Foundation
 
 nonisolated struct Vehicle: Identifiable, Hashable, Sendable {
     enum Source: String, Sendable {
-        case nta, irishRail, luasEstimate
+        case nta, irishRail, luasEstimate, luasForecast
 
         var label: String {
             switch self {
             case .nta: "Live GPS · NTA"
             case .irishRail: "Live · Irish Rail"
             case .luasEstimate: "Estimated from live timetable"
+            case .luasForecast: "Live · Luas stop forecasts"
             }
         }
     }

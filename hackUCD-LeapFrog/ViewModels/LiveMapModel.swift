@@ -40,7 +40,11 @@ final class LiveMapModel {
     static let vehiclesInterval: TimeInterval = 20
     /// The NTA API allows TripUpdates about once a minute per key.
     static let tripUpdatesInterval: TimeInterval = 65
-    static let irishRailInterval: TimeInterval = 30
+    /// Irish Rail is keyless and cheap; polling it often lets a DART leave a station
+    /// on screen soon after the feed confirms it really has (~10 s publishing delay).
+    static let irishRailInterval: TimeInterval = 10
+    /// Luas observer stops are re-read this often (RPA forecasts update about every 30 s).
+    static let luasInterval: TimeInterval = 30
     /// Retry gap after a network error, or a 429 that didn't say how long to wait.
     static let errorRetry: TimeInterval = 10
 
@@ -66,6 +70,9 @@ final class LiveMapModel {
     /// The track each placement's distance is measured along.
     private(set) var railPaths: [String: RouteShape] = [:]
     @ObservationIgnored private var railTracker: RailTracker?
+    /// Luas trams from the RPA stop forecasts; NTA TripUpdates estimates are the fallback.
+    @ObservationIgnored private var luasLive: LuasLiveTracker?
+    private var nextLuasAt: Date = .distantPast
     /// Each DART's journey timeline from Irish Rail movements, by vehicle id.
     @ObservationIgnored private var dartJourneys: [String: (calls: [RailCall], fetchedAt: Date, status: String)] = [:]
     @ObservationIgnored private var railStations: [String: (latitude: Double, longitude: Double)]?
@@ -179,7 +186,9 @@ final class LiveMapModel {
     /// Snaps buses to their routes and moves each to its estimated position now.
     private func trackBuses(_ merged: [Vehicle]) -> [Vehicle] {
         if let railTracker {
-            var calls = LuasEstimator.calls(tripUpdates: tripUpdates?.entity?.compactMap(\.tripUpdate) ?? [], data: data)
+            var calls = luasLive?.isLive == true
+                ? luasLive!.calls()
+                : LuasEstimator.calls(tripUpdates: tripUpdates?.entity?.compactMap(\.tripUpdate) ?? [], data: data)
             var fetchedAt: [String: Date] = [:]
             for (id, journey) in dartJourneys {
                 calls[id] = journey.calls
@@ -256,6 +265,7 @@ final class LiveMapModel {
         }
         if railTracker == nil {
             railTracker = RailTracker(data: data)
+            luasLive = LuasLiveTracker(data: data)
         }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.pollFeeds() }
@@ -277,7 +287,7 @@ final class LiveMapModel {
             #endif
             await refresh()
             // Wake when the next feed is due (still at least every 30s, so Luas estimates keep moving).
-            let nextDue = min(nextVehiclesAt, nextTripUpdatesAt, nextIrishRailAt).timeIntervalSinceNow
+            let nextDue = min(nextVehiclesAt, nextTripUpdatesAt, nextIrishRailAt, nextLuasAt).timeIntervalSinceNow
             try? await Task.sleep(for: .seconds(min(max(nextDue, 1), 30)))
         }
     }
@@ -287,6 +297,7 @@ final class LiveMapModel {
         let fetchVehicles = now >= nextVehiclesAt
         let fetchTrips = now >= nextTripUpdatesAt
         let fetchRail = now >= nextIrishRailAt
+        if now >= nextLuasAt { await refreshLuas(now: now) }
 
         async let vehicleResult: Result<GTFSRFeed, Error>? = fetchVehicles ? Result.catching { try await nta.vehicles() } : nil
         async let tripResult: Result<GTFSRFeed, Error>? = fetchTrips ? Result.catching { try await nta.tripUpdates() } : nil
@@ -320,10 +331,37 @@ final class LiveMapModel {
             irishRail: lastRailTrains,
             data: data
         )
-        if !merged.isEmpty || lastVehicleFeed != nil {
-            setVehicles(trackBuses(merged))
+        var vehicles = merged
+        if let luasLive, luasLive.isLive {
+            vehicles.removeAll { $0.source == .luasEstimate }
+            vehicles += luasLive.vehicles(now: now)
+        }
+        if !vehicles.isEmpty || lastVehicleFeed != nil {
+            setVehicles(trackBuses(vehicles))
         }
         updateStatus(vehicleError: vehicleFeed?.failure, railError: rail?.failure, now: now)
+    }
+
+    /// Reads the Luas observer stops' forecasts and updates the live trams.
+    private func refreshLuas(now: Date) async {
+        guard let luasLive else { return }
+        let client = luas
+        let observations = await withTaskGroup(of: LuasLiveTracker.Observation?.self) { group in
+            for code in luasLive.observerCodes {
+                group.addTask {
+                    guard let forecast = try? await client.forecast(stopCode: code) else { return nil }
+                    return LuasLiveTracker.Observation(stopCode: code, fetchedAt: .now, arrivals: forecast.arrivals)
+                }
+            }
+            return await group.reduce(into: [LuasLiveTracker.Observation]()) { if let o = $1 { $0.append(o) } }
+        }
+        luasLive.update(observations, now: now)
+        #if DEBUG
+        NSLog("[Luas] %d/%d observer stops answered, %d trams tracked", observations.count,
+              luasLive.observerCodes.count, luasLive.vehicles(now: now).count)
+        #endif
+        // Most stops answering is a success; otherwise retry soon.
+        nextLuasAt = now.addingTimeInterval(observations.count * 2 >= luasLive.observerCodes.count ? Self.luasInterval : Self.errorRetry)
     }
 
     /// Fetches the movements of every running DART whose status changed since its
