@@ -194,6 +194,9 @@ struct BottomMenu: View {
                 .buttonStyle(.plain)
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
+            // Always measure the options at their natural height, even while the panel is
+            // squeezed mid-drag; otherwise the target height would chase the drag.
+            .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { menuContentHeight = $0 }
             .padding(.horizontal, 16)
             .padding(.top, Self.menuTopPadding)
@@ -212,7 +215,9 @@ struct BottomMenu: View {
     }
 
     private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 12)
+        // Measured in screen space: the panel resizes as it's dragged, so local
+        // coordinates would shift under a still finger and the height would oscillate.
+        DragGesture(minimumDistance: 12, coordinateSpace: .global)
             .updating($drag) { value, state, _ in state = value.translation.height }
             .onEnded { value in
                 let predicted = value.predictedEndTranslation.height
