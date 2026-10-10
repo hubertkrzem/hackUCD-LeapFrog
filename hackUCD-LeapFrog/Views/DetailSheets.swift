@@ -244,12 +244,13 @@ struct VehicleDetailSheet: View {
                         Divider().padding(.leading, 44)
                     }
                     TimelineView(.periodic(from: .now, by: 1)) { context in
-                        InfoRow(symbol: "clock", title: "Updated",
+                        InfoRow(symbol: "clock", title: model.isRouteEstimated(vehicle.id) ? "GPS ping" : "Updated",
                                 value: "\(max(0, Int(context.date.timeIntervalSince(vehicle.timestamp))))s ago")
                     }
                     Divider().padding(.leading, 44)
                     InfoRow(symbol: vehicle.isEstimated ? "wand.and.stars" : "dot.radiowaves.left.and.right",
-                            title: "Source", value: vehicle.source.label)
+                            title: "Source",
+                            value: model.isRouteEstimated(vehicle.id) ? "Estimated along route" : vehicle.source.label)
                 }
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
 

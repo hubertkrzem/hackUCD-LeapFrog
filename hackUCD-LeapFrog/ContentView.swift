@@ -15,6 +15,9 @@ struct ContentView: View {
                 watchedStop: model.watchedStop,
                 etas: model.watchETAs,
                 selectedVehicleId: model.selectedVehicleId,
+                estimatedPositions: model.estimatedPositions,
+                positionsVersion: model.positionsVersion,
+                selectedRoute: model.selectedRoute,
                 cameraRequest: model.cameraRequest,
                 onSelect: { model.selection = $0 },
                 onRegionChange: { model.mapCenterChanged($0) }

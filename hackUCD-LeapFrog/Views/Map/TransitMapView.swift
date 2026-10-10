@@ -12,6 +12,11 @@ struct TransitMapView: UIViewRepresentable {
     let watchedStop: Stop?
     let etas: [String: Date]
     let selectedVehicleId: String?
+    /// Route-based live estimates for buses, refreshed every second.
+    let estimatedPositions: [String: BusTracker.Estimate]
+    let positionsVersion: Int
+    /// The selected bus's route, drawn while its sheet is open.
+    let selectedRoute: (id: String, coordinates: [CLLocationCoordinate2D])?
     let cameraRequest: LiveMapModel.CameraRequest?
     let onSelect: (LiveMapModel.Selection) -> Void
     /// Reports the map centre when the user stops panning.
@@ -68,6 +73,12 @@ struct TransitMapView: UIViewRepresentable {
             coordinator.syncVehicles()
         }
 
+        if positionsVersion != coordinator.lastPositionsVersion {
+            coordinator.lastPositionsVersion = positionsVersion
+            coordinator.applyEstimates(estimatedPositions)
+        }
+        coordinator.syncSelectedRoute(selectedRoute)
+
         if let cameraRequest, cameraRequest != coordinator.lastCameraRequest {
             coordinator.lastCameraRequest = cameraRequest
             coordinator.apply(cameraRequest)
@@ -90,12 +101,16 @@ struct TransitMapView: UIViewRepresentable {
         var lastCameraRequest: LiveMapModel.CameraRequest?
         var lastStopsKey: StopsKey?
         var lastVehiclesKey: VehiclesKey?
+        var lastPositionsVersion = -1
+        private var routeOverlay: (id: String, polyline: ColoredPolyline)?
 
         private var linesLoaded = false
         private var railStops: [String: StopAnnotation] = [:]
         private var busStops: [String: StopAnnotation] = [:]
         private var vehicles: [String: VehicleAnnotation] = [:]
         private var watched: WatchedStopAnnotation?
+        /// Camera heading the vehicle sprites were last oriented for.
+        private var spriteHeading: Double = 0
 
         // MARK: Sync
 
@@ -190,10 +205,12 @@ struct TransitMapView: UIViewRepresentable {
                 }
                 let old = annotation.coordinate
                 annotation.vehicle = vehicle
+                annotation.updateHeading(from: old)
                 if let view = mapView.view(for: annotation) as? VehicleMarkerView {
                     configure(view, for: vehicle, parent: parent)
                 }
-                if old != vehicle.coordinate {
+                // Route-tracked buses are moved by the 1 s estimate tick instead.
+                if old != vehicle.coordinate && parent.estimatedPositions[id] == nil {
                     // Only on-screen movement is worth animating.
                     if visible.contains(MKMapPoint(old)) || visible.contains(MKMapPoint(vehicle.coordinate)) {
                         moves.append((annotation, vehicle.coordinate))
@@ -211,12 +228,54 @@ struct TransitMapView: UIViewRepresentable {
         }
 
         private func configure(_ view: VehicleMarkerView, for vehicle: Vehicle, parent: TransitMapView) {
-            view.configure(with: vehicle, eta: parent.etas[vehicle.id].map { Self.etaText($0) })
+            let heading = vehicles[vehicle.id]?.heading ?? vehicle.bearing
+            view.configure(with: vehicle, eta: parent.etas[vehicle.id].map { Self.etaText($0) },
+                           heading: heading.map { $0 - (mapView?.camera.heading ?? 0) })
         }
 
         static func etaText(_ date: Date) -> String {
             let minutes = Int(date.timeIntervalSinceNow / 60)
             return minutes <= 0 ? "Due" : "\(minutes) min"
+        }
+
+        /// Glides each tracked bus to its latest estimate and turns its 3D model to
+        /// face along the road. Steps are ~1 s of travel (5–15 m), so straight-line
+        /// animation stays on the road.
+        func applyEstimates(_ estimates: [String: BusTracker.Estimate]) {
+            guard let mapView, let parent else { return }
+            let visible = mapView.visibleMapRect
+            var moves: [(VehicleAnnotation, CLLocationCoordinate2D)] = []
+            for (id, estimate) in estimates {
+                guard let annotation = vehicles[id] else { continue }
+                let coordinate = CLLocationCoordinate2D(latitude: estimate.latitude, longitude: estimate.longitude)
+                guard coordinate != annotation.coordinate else { continue }
+                annotation.followRoute(bearing: estimate.bearing)
+                if let view = mapView.view(for: annotation) as? VehicleMarkerView {
+                    configure(view, for: annotation.vehicle, parent: parent)
+                }
+                if visible.contains(MKMapPoint(coordinate)) || visible.contains(MKMapPoint(annotation.coordinate)) {
+                    moves.append((annotation, coordinate))
+                } else {
+                    annotation.coordinate = coordinate
+                }
+            }
+            guard !moves.isEmpty else { return }
+            UIView.animate(withDuration: 1, delay: 0, options: [.curveLinear, .beginFromCurrentState, .allowUserInteraction]) {
+                for (annotation, coordinate) in moves { annotation.coordinate = coordinate }
+            }
+        }
+
+        func syncSelectedRoute(_ route: (id: String, coordinates: [CLLocationCoordinate2D])?) {
+            guard let mapView, routeOverlay?.id != route?.id else { return }
+            if let routeOverlay { mapView.removeOverlay(routeOverlay.polyline) }
+            routeOverlay = nil
+            guard let route, route.coordinates.count > 1 else { return }
+            var coordinates = route.coordinates
+            let polyline = ColoredPolyline(coordinates: &coordinates, count: coordinates.count)
+            polyline.color = Theme.greenUI
+            polyline.mode = .bus
+            mapView.addOverlay(polyline, level: .aboveRoads)
+            routeOverlay = (route.id, polyline)
         }
 
         func apply(_ request: LiveMapModel.CameraRequest) {
@@ -234,6 +293,20 @@ struct TransitMapView: UIViewRepresentable {
         }
 
         // MARK: MKMapViewDelegate
+
+        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
+            // Re-orient sprites once the map has rotated past half a heading bucket.
+            let heading = mapView.camera.heading
+            var delta = abs(heading - spriteHeading).truncatingRemainder(dividingBy: 360)
+            delta = min(delta, 360 - delta)
+            guard delta >= VehicleSpriteRenderer.bucketDegrees / 2, let parent else { return }
+            spriteHeading = heading
+            for annotation in vehicles.values {
+                if let view = mapView.view(for: annotation) as? VehicleMarkerView {
+                    configure(view, for: annotation.vehicle, parent: parent)
+                }
+            }
+        }
 
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
             syncStops()
@@ -267,7 +340,7 @@ struct TransitMapView: UIViewRepresentable {
             guard let polyline = overlay as? ColoredPolyline else { return MKOverlayRenderer(overlay: overlay) }
             let renderer = MKPolylineRenderer(polyline: polyline)
             renderer.strokeColor = polyline.color.withAlphaComponent(0.85)
-            renderer.lineWidth = polyline.mode == .dart ? 4 : 3.5
+            renderer.lineWidth = polyline.mode == .bus ? 5 : polyline.mode == .dart ? 4 : 3.5
             renderer.lineCap = .round
             renderer.lineJoin = .round
             return renderer
@@ -317,10 +390,32 @@ final class WatchedStopAnnotation: NSObject, MKAnnotation {
 final class VehicleAnnotation: NSObject, MKAnnotation {
     var vehicle: Vehicle
     @objc dynamic var coordinate: CLLocationCoordinate2D
+    /// Degrees clockwise from north. The NTA and Irish Rail feeds often omit
+    /// bearing, so it falls back to the direction of the last real movement.
+    private(set) var heading: Double?
 
     init(vehicle: Vehicle) {
         self.vehicle = vehicle
         coordinate = vehicle.coordinate
+        heading = vehicle.bearing
+    }
+
+    /// Route-tracked buses face along the road at their estimated position.
+    func followRoute(bearing: Double) {
+        heading = bearing
+    }
+
+    func updateHeading(from old: CLLocationCoordinate2D) {
+        if let bearing = vehicle.bearing {
+            heading = bearing
+            return
+        }
+        let new = vehicle.coordinate
+        // Ignore GPS jitter while stopped.
+        guard CLLocation(latitude: old.latitude, longitude: old.longitude)
+            .distance(from: CLLocation(latitude: new.latitude, longitude: new.longitude)) > 15 else { return }
+        heading = LuasEstimator.bearing(fromLat: old.latitude, fromLon: old.longitude,
+                                        toLat: new.latitude, toLon: new.longitude)
     }
 }
 

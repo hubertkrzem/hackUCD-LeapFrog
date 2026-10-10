@@ -57,6 +57,10 @@ final class LiveMapModel {
     private(set) var tripUpdates: GTFSRFeed?
     private(set) var status: Status = .loading
     private(set) var lastUpdated: Date?
+    /// Where each tracked bus is estimated to be right now, refreshed every second.
+    private(set) var estimatedPositions: [String: BusTracker.Estimate] = [:]
+    private(set) var positionsVersion = 0
+    @ObservationIgnored private var tracker: BusTracker?
     var enabledModes: Set<TransportMode> = Set(TransportMode.allCases) {
         didSet { recomputeDisplayed() }
     }
@@ -160,6 +164,43 @@ final class LiveMapModel {
         VehicleMerger.merge(ntaVehicles: ntaVehicles, tripUpdates: tripUpdates, irishRail: irishRail, data: data)
     }
 
+    /// Snaps buses to their routes and moves each to its estimated position now.
+    private func trackBuses(_ merged: [Vehicle]) -> [Vehicle] {
+        guard let tracker else { return merged }
+        tracker.ingest(merged.filter { $0.source == .nta })
+        #if DEBUG
+        if !tracker.accuracy.estimateErrors.isEmpty { print("[BusTracker]", tracker.accuracy.summary) }
+        #endif
+        return merged.map { vehicle in
+            tracker.estimate(for: vehicle.id).map { vehicle.moved(to: $0) } ?? vehicle
+        }
+    }
+
+    /// Advances every tracked bus on screen along its route, once a second.
+    private func runEstimates() async {
+        while !Task.isCancelled {
+            if let tracker {
+                var positions: [String: BusTracker.Estimate] = [:]
+                for vehicle in displayedVehicles where vehicle.mode == .bus {
+                    positions[vehicle.id] = tracker.estimate(for: vehicle.id)
+                }
+                estimatedPositions = positions
+                positionsVersion += 1
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    func isRouteEstimated(_ vehicleId: String) -> Bool {
+        tracker?.isTracked(vehicleId) ?? false
+    }
+
+    /// The selected bus's route, to draw on the map.
+    var selectedRoute: (id: String, coordinates: [CLLocationCoordinate2D])? {
+        guard case .vehicle(let vehicle) = selection, let shape = tracker?.shape(for: vehicle.id) else { return nil }
+        return (vehicle.id, shape.coordinates.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
+    }
+
     private func setVehicles(_ merged: [Vehicle]) {
         vehicles = merged
         lastUpdated = .now
@@ -177,14 +218,24 @@ final class LiveMapModel {
                 return
             }
         }
+        if tracker == nil, let store = try? await BusRouteStore.loadFromBundle() {
+            tracker = BusTracker(store: store)
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.pollFeeds() }
+            group.addTask { await self.runEstimates() }
+        }
+    }
+
+    private func pollFeeds() async {
         while !Task.isCancelled {
             #if DEBUG
-            if var feed = synthetic {
-                let fake = feed.tick(data: data)
+            if var feed = synthetic, let store = tracker?.store {
+                let fake = feed.tick(data: data, routes: store)
                 synthetic = feed
-                setVehicles(fake)
+                setVehicles(trackBuses(fake))
                 status = .live
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(SyntheticFeed.pingInterval))
                 continue
             }
             #endif
@@ -231,7 +282,7 @@ final class LiveMapModel {
             data: data
         )
         if !merged.isEmpty || lastVehicleFeed != nil {
-            setVehicles(merged)
+            setVehicles(trackBuses(merged))
         }
         updateStatus(vehicleError: vehicleFeed?.failure, railError: rail?.failure, now: now)
     }

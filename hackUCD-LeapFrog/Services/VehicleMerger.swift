@@ -67,7 +67,8 @@ nonisolated enum VehicleMerger {
                 source: .nta,
                 tripId: vehicle.trip?.tripId,
                 routeId: vehicle.trip?.routeId,
-                directionId: vehicle.trip?.directionId?.value
+                directionId: vehicle.trip?.directionId?.value,
+                tripStart: vehicle.trip?.scheduledStart
             )
         }
     }

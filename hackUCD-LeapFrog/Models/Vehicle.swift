@@ -30,12 +30,22 @@ nonisolated struct Vehicle: Identifiable, Hashable, Sendable {
     /// Nil for Irish Rail trains, which aren't keyed by GTFS route.
     var routeId: String? = nil
     var directionId: Int? = nil
+    /// Scheduled start of the trip (GTFS-R start_date + start_time), for route-based estimates.
+    var tripStart: Date? = nil
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 
     var isEstimated: Bool { source == .luasEstimate }
+
+    /// A copy placed at a route-based estimate (position and road bearing).
+    func moved(to estimate: BusTracker.Estimate) -> Vehicle {
+        Vehicle(id: id, mode: mode, latitude: estimate.latitude, longitude: estimate.longitude, routeName: routeName,
+                routeDescription: routeDescription, operatorName: operatorName, headsign: headsign,
+                bearing: estimate.bearing, timestamp: timestamp, source: source, tripId: tripId,
+                routeId: routeId, directionId: directionId, tripStart: tripStart)
+    }
 }
 
 /// A predicted arrival shown in a stop's detail sheet.

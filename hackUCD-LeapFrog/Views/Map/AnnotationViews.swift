@@ -78,17 +78,15 @@ final class StopClusterView: MKAnnotationView {
     }
 }
 
-/// A live vehicle: a coloured disc with the route number and a heading arrow.
-/// The disc is a cached bitmap, so each marker is one image plus the arrow.
+/// A live vehicle: a pre-rendered 3D model turned to its heading, with a route
+/// badge above buses. Sprites are cached per mode and bearing bucket.
 final class VehicleMarkerView: MKAnnotationView {
     static let reuseID = "Vehicle"
-    static let diameter: CGFloat = 28
-    static let canvas: CGFloat = 40
+    static let canvas: CGFloat = 52
 
-    private let arrow = CAShapeLayer()
+    private let badge = UILabel()
     private let caption = UILabel()
     private var imageKey: String?
-    private var appliedBearing: Double?
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
@@ -96,116 +94,69 @@ final class VehicleMarkerView: MKAnnotationView {
         collisionMode = .circle
         displayPriority = .required
         zPriority = .max
+        // The sprite camera aims 1.5 m above the model's middle; lift the view so the
+        // vehicle's ground point, not that aim point, sits on its map coordinate.
+        centerOffset = CGPoint(x: 0, y: -VehicleSpriteRenderer.groundOffset(side: Self.canvas))
 
-        arrow.frame = bounds
-        let mid = bounds.midX
-        let path = UIBezierPath()
-        path.move(to: CGPoint(x: mid, y: 0))
-        path.addLine(to: CGPoint(x: mid + 6, y: 8))
-        path.addLine(to: CGPoint(x: mid - 6, y: 8))
-        path.close()
-        arrow.path = path.cgPath
-        arrow.actions = ["transform": NSNull()]
-        layer.addSublayer(arrow)
-
-        caption.font = .systemFont(ofSize: 10, weight: .heavy)
-        caption.textAlignment = .center
-        caption.backgroundColor = .white
-        caption.layer.cornerRadius = 7
-        caption.layer.masksToBounds = true
-        caption.isHidden = true
-        addSubview(caption)
+        for label in [badge, caption] {
+            label.font = .systemFont(ofSize: 10, weight: .heavy)
+            label.textAlignment = .center
+            label.backgroundColor = .white
+            label.layer.cornerRadius = 7
+            label.layer.masksToBounds = true
+            label.isHidden = true
+            addSubview(label)
+        }
+        badge.textColor = Theme.greenUI
+        badge.layer.borderColor = Theme.greenUI.cgColor
+        badge.layer.borderWidth = 1
+        caption.textColor = Theme.greenUI
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        appliedBearing = nil
-    }
-
-    func configure(with vehicle: Vehicle, eta: String?) {
-        let key = MarkerImageCache.key(for: vehicle)
+    /// `heading` is relative to the screen (bearing minus camera heading), since
+    /// annotation views don't rotate with the map. Unknown headings face up.
+    func configure(with vehicle: Vehicle, eta: String?, heading: Double?) {
+        let bucket = VehicleSpriteRenderer.bucket(for: heading ?? 0)
+        let key = MarkerImageCache.key(for: vehicle, bucket: bucket)
         if key != imageKey {
             imageKey = key
-            image = MarkerImageCache.image(for: vehicle, key: key)
-            arrow.fillColor = vehicle.mode.tintUI.cgColor
+            image = MarkerImageCache.image(for: vehicle, bucket: bucket, key: key)
         }
 
-        if let bearing = vehicle.bearing {
-            arrow.isHidden = false
-            if bearing != appliedBearing {
-                appliedBearing = bearing
-                arrow.setAffineTransform(CGAffineTransform(rotationAngle: bearing * .pi / 180))
-            }
-        } else {
-            arrow.isHidden = true
+        badge.isHidden = vehicle.mode != .bus
+        if vehicle.mode == .bus {
+            badge.text = vehicle.routeName
+            let width = max(badge.intrinsicContentSize.width + 10, 22)
+            badge.frame = CGRect(x: (Self.canvas - width) / 2, y: -6, width: width, height: 14)
         }
 
         caption.isHidden = eta == nil
         if let eta {
             caption.text = eta
-            caption.textColor = Theme.greenUI
             let width = caption.intrinsicContentSize.width + 10
-            caption.frame = CGRect(x: (Self.canvas - width) / 2, y: Self.canvas - 4, width: width, height: 14)
+            caption.frame = CGRect(x: (Self.canvas - width) / 2, y: Self.canvas - 6, width: width, height: 14)
         }
         accessibilityLabel = "\(vehicle.mode.title) \(vehicle.routeName)\(vehicle.headsign.map { " to \($0)" } ?? "")"
     }
 }
 
-/// Pre-rendered vehicle discs keyed by mode, route label and style.
+/// Pre-rendered vehicle sprites keyed by mode, heading bucket and style.
 enum MarkerImageCache {
     private static let cache = NSCache<NSString, UIImage>()
 
-    static func key(for vehicle: Vehicle) -> String {
-        "\(vehicle.mode.rawValue)|\(vehicle.mode == .bus ? vehicle.routeName : "")|\(vehicle.isEstimated)"
+    static func key(for vehicle: Vehicle, bucket: Int) -> String {
+        "\(vehicle.mode.rawValue)|\(bucket)|\(vehicle.isEstimated)"
     }
 
-    static func image(for vehicle: Vehicle, key: String) -> UIImage {
+    static func image(for vehicle: Vehicle, bucket: Int, key: String) -> UIImage {
         if let cached = cache.object(forKey: key as NSString) { return cached }
-        let image = render(vehicle)
+        let image = VehicleSpriteRenderer.image(mode: vehicle.mode, bucket: bucket,
+                                                estimated: vehicle.isEstimated, side: VehicleMarkerView.canvas)
         cache.setObject(image, forKey: key as NSString)
         return image
-    }
-
-    private static func render(_ vehicle: Vehicle) -> UIImage {
-        let canvas = VehicleMarkerView.canvas, d = VehicleMarkerView.diameter
-        let tint = vehicle.mode.tintUI
-        let disc = CGRect(x: (canvas - d) / 2, y: (canvas - d) / 2, width: d, height: d)
-        return UIGraphicsImageRenderer(size: CGSize(width: canvas, height: canvas)).image { context in
-            let cg = context.cgContext
-            cg.saveGState()
-            cg.setShadow(offset: CGSize(width: 0, height: 1.5), blur: 4, color: UIColor.black.withAlphaComponent(0.25).cgColor)
-            UIColor.white.setFill()
-            UIBezierPath(ovalIn: disc).fill()
-            cg.restoreGState()
-
-            (vehicle.isEstimated ? tint.withAlphaComponent(0.75) : tint).setFill()
-            UIBezierPath(ovalIn: disc.insetBy(dx: 2, dy: 2)).fill()
-
-            if vehicle.mode == .bus {
-                let name = vehicle.routeName
-                // Shrink long route names (e.g. "41X", "120A") to fit the disc.
-                var fontSize: CGFloat = 11
-                var attributes: [NSAttributedString.Key: Any] = [:]
-                var size = CGSize.zero
-                repeat {
-                    attributes = [.font: UIFont.systemFont(ofSize: fontSize, weight: .heavy), .foregroundColor: UIColor.white]
-                    size = (name as NSString).size(withAttributes: attributes)
-                    fontSize -= 0.5
-                } while size.width > d - 5 && fontSize >= 7
-                size.width = min(size.width, d - 4)
-                (name as NSString).draw(
-                    with: CGRect(x: disc.midX - size.width / 2, y: disc.midY - size.height / 2, width: size.width, height: size.height),
-                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attributes, context: nil
-                )
-            } else if let symbol = UIImage(systemName: vehicle.mode.symbol,
-                                           withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .bold)) {
-                let icon = symbol.withTintColor(.white, renderingMode: .alwaysOriginal)
-                icon.draw(at: CGPoint(x: disc.midX - icon.size.width / 2, y: disc.midY - icon.size.height / 2))
-            }
-        }
     }
 }
 

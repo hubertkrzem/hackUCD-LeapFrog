@@ -8,6 +8,10 @@ writes to hackUCD-LeapFrog/Resources/:
   routes.json - route_id -> {s: short name, l: long name, m: mode, o: operator}
   lines.json  - simplified polylines for the Luas Red/Green lines and DART
   stop_routes.json - stop_id -> [[route_id, direction_id], ...] serving it
+  bus_shapes.bin   - raw-DEFLATE binary: every bus shape (simplified to 4 m) plus a
+                     timing profile (metres along route, seconds after trip start)
+  bus_trips.json.deflate - raw-DEFLATE JSON: trip_id -> shape index, and
+                     "route_id|direction_id" -> shape indices (fallback)
   luas.json   - Luas stop patterns + trip_id -> pattern, used to estimate tram
                 positions from GTFS-R TripUpdates
 
@@ -22,11 +26,13 @@ import io
 import json
 import math
 import os
+import struct
 import sys
 import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from collections import defaultdict
 
 GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_Realtime.zip"
@@ -157,6 +163,7 @@ def build(gtfs_dir, out_dir):
     stop_modes = defaultdict(set)
     stop_routes = defaultdict(set)  # stop_id -> {(route_id, direction_id)}
     luas_trips = defaultdict(list)  # trip_id -> [(seq, stop_id, arrival_secs)]
+    bus_trip_start = {}  # trip_id -> (first stop_sequence, departure secs)
     print("Scanning stop_times.txt ...", file=sys.stderr)
     f, rows = open_csv(gtfs_dir, "stop_times.txt")
     for row in rows:
@@ -170,6 +177,11 @@ def build(gtfs_dir, out_dir):
             luas_trips[row["trip_id"]].append(
                 (int(row["stop_sequence"]), row["stop_id"], parse_time(row["arrival_time"]))
             )
+        elif mode == BUS:
+            seq = int(row["stop_sequence"])
+            current = bus_trip_start.get(row["trip_id"])
+            if current is None or seq < current[0]:
+                bus_trip_start[row["trip_id"]] = (seq, parse_time(row["departure_time"] or row["arrival_time"]))
     f.close()
 
     # Stops
@@ -209,7 +221,8 @@ def build(gtfs_dir, out_dir):
     for trip_id, rid in trip_route.items():
         if route_modes[rid] in (LUAS, DART):
             wanted_shapes[rid].add(trip_shape[trip_id])
-    all_wanted = set().union(*wanted_shapes.values()) if wanted_shapes else set()
+    bus_shape_ids = {trip_shape[t] for t, rid in trip_route.items() if route_modes[rid] == BUS and trip_shape[t]}
+    all_wanted = set().union(*wanted_shapes.values(), bus_shape_ids)
     shape_points = defaultdict(list)
     print("Scanning shapes.txt ...", file=sys.stderr)
     f, rows = open_csv(gtfs_dir, "shapes.txt")
@@ -237,6 +250,9 @@ def build(gtfs_dir, out_dir):
             lines.append({"r": rid, "m": route_modes[rid], "n": routes[rid]["s"],
                           "p": [list(p) for p in simplify(pts)]})
 
+    bus_stats = build_bus_routes(gtfs_dir, out_dir, trip_route, trip_shape, trip_direction, route_modes,
+                                 bus_trip_start, shape_points, stop_coords)
+
     def dump(name, obj):
         path = os.path.join(out_dir, name)
         with open(path, "w", encoding="utf-8") as out:
@@ -253,7 +269,124 @@ def build(gtfs_dir, out_dir):
     for s in stops:
         counts[s["m"]] += 1
     print(f"stops by mode: {dict(counts)}; luas patterns: {len(patterns)}, "
-          f"luas trips: {len(trip_patterns)}, lines: {[l['n'] for l in lines]}", file=sys.stderr)
+          f"luas trips: {len(trip_patterns)}, lines: {[l['n'] for l in lines]}; {bus_stats}", file=sys.stderr)
+
+
+def cumulative_metres(pts):
+    cum = [0.0]
+    for (la1, lo1), (la2, lo2) in zip(pts, pts[1:]):
+        cum.append(cum[-1] + haversine_m(la1, lo1, la2, lo2))
+    return cum
+
+
+def project_onto(pts, cum, lat, lon, start_index, window_m=3000.0):
+    """Nearest point on the polyline at or after `start_index`, preferring the next
+    `window_m` metres so a stop on a looping route maps to the right pass.
+    Returns (segment index, metres along, metres off route)."""
+    def search(lo, hi):
+        best = (float("inf"), start_index, cum[start_index])
+        for i in range(lo, hi):
+            (la1, lo1), (la2, lo2) = pts[i], pts[i + 1]
+            k = math.cos(math.radians(la1)) * 111320.0
+            ax, ay = (lon - lo1) * k, (lat - la1) * 110540.0
+            bx, by = (lo2 - lo1) * k, (la2 - la1) * 110540.0
+            seg2 = bx * bx + by * by
+            t = 0.0 if seg2 == 0 else max(0.0, min(1.0, (ax * bx + ay * by) / seg2))
+            d = math.hypot(ax - t * bx, ay - t * by)
+            if d < best[0]:
+                best = (d, i, cum[i] + t * (cum[i + 1] - cum[i]))
+        return best
+
+    n = len(pts) - 1
+    hi = start_index
+    while hi < n and cum[hi] - cum[start_index] < window_m:
+        hi += 1
+    off, index, along = search(start_index, max(hi, start_index + 1) if n > start_index else start_index)
+    if off > 150 and hi < n:
+        off, index, along = search(start_index, n)
+    return index, along, off
+
+
+def build_bus_routes(gtfs_dir, out_dir, trip_route, trip_shape, trip_direction, route_modes,
+                     bus_trip_start, shape_points, stop_coords):
+    """Writes bus_shapes.bin and bus_trips.json.deflate (see module docstring)."""
+    bus_trips = [t for t, rid in trip_route.items() if route_modes[rid] == BUS and trip_shape.get(t) in shape_points]
+    shape_ids = sorted({trip_shape[t] for t in bus_trips})
+    shape_index = {sid: i for i, sid in enumerate(shape_ids)}
+
+    # Representative trip per shape: the one starting closest to midday.
+    representative = {}
+    for t in bus_trips:
+        start = bus_trip_start.get(t)
+        if start is None:
+            continue
+        sid = trip_shape[t]
+        score = abs(start[1] - 12 * 3600)
+        if sid not in representative or score < representative[sid][0]:
+            representative[sid] = (score, t, start[1])
+    rep_trips = {v[1]: (sid, v[2]) for sid, v in representative.items()}
+
+    print("Scanning stop_times.txt for bus timing profiles ...", file=sys.stderr)
+    rep_stops = defaultdict(list)
+    f, rows = open_csv(gtfs_dir, "stop_times.txt")
+    for row in rows:
+        if row["trip_id"] in rep_trips:
+            rep_stops[row["trip_id"]].append(
+                (int(row["stop_sequence"]), row["stop_id"], parse_time(row["arrival_time"] or row["departure_time"])))
+    f.close()
+
+    profiles = {}
+    for trip_id, entries in rep_stops.items():
+        sid, start = rep_trips[trip_id]
+        profiles[sid] = (start, sorted(entries))
+
+    geometry, total_points, total_profile = bytearray(b"LFB1"), 0, 0
+    geometry += struct.pack("<I", len(shape_ids))
+    for sid in shape_ids:
+        pts = simplify([(la, lo) for _, la, lo in sorted(shape_points[sid])], tolerance_m=4.0)
+        pts = [(round(la, 5), round(lo, 5)) for la, lo in pts]
+        cum = cumulative_metres(pts)
+        profile = []
+        if sid in profiles and len(pts) > 1:
+            start, entries = profiles[sid]
+            index, last_d, last_t = 0, 0.0, 0.0
+            for _, stop_id, secs in entries:
+                coord = stop_coords.get(stop_id)
+                if coord is None:
+                    continue
+                index, along, off = project_onto(pts, cum, coord[0], coord[1], index)
+                if off > 200:
+                    continue
+                # Keep distance and time monotonic so the profile is invertible.
+                d, t = max(along, last_d), max(float(secs - start), last_t)
+                profile.append((d, t))
+                last_d, last_t = d, t
+        geometry += struct.pack("<II", len(pts), len(profile))
+        for la, lo in pts:
+            geometry += struct.pack("<ii", round(la * 1e5), round(lo * 1e5))
+        for d, t in profile:
+            geometry += struct.pack("<ff", d, t)
+        total_points += len(pts)
+        total_profile += 1 if profile else 0
+
+    routes_index = defaultdict(set)
+    for t in bus_trips:
+        routes_index[f"{trip_route[t]}|{trip_direction[t]}"].add(shape_index[trip_shape[t]])
+    trips_json = json.dumps({
+        "trips": {t: shape_index[trip_shape[t]] for t in bus_trips},
+        "routes": {k: sorted(v) for k, v in routes_index.items()},
+    }, separators=(",", ":")).encode()
+
+    def deflate(data):
+        compressor = zlib.compressobj(9, zlib.DEFLATED, -15)  # raw DEFLATE, as NSData expects
+        return compressor.compress(bytes(data)) + compressor.flush()
+
+    for name, payload in (("bus_shapes.bin", geometry), ("bus_trips.json.deflate", trips_json)):
+        path = os.path.join(out_dir, name)
+        with open(path, "wb") as out:
+            out.write(deflate(payload))
+        print(f"wrote {path} ({os.path.getsize(path) // 1024} KB, {len(payload) // 1024} KB inflated)", file=sys.stderr)
+    return f"bus shapes: {len(shape_ids)} ({total_points:,} pts, {total_profile} with timing), bus trips: {len(bus_trips):,}"
 
 
 def main():
