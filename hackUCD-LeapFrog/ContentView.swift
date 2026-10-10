@@ -42,7 +42,7 @@ struct ContentView: View {
             .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.38)))
         }
         .fullScreenCover(isPresented: $showingChat) {
-            ChatScreen { showingChat = false }
+            ChatScreen(model: model) { showingChat = false }
         }
     }
 
