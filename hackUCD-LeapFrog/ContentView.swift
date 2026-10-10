@@ -42,6 +42,10 @@ struct ContentView: View {
         }
     }
 
+    private func closeMenu() {
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) { menu = .collapsed }
+    }
+
     /// The map plus its floating chrome; the bottom menu is layered over this.
     private func content(controlsInset: CGFloat) -> some View {
         ZStack {
@@ -63,6 +67,16 @@ struct ContentView: View {
                 onRegionChange: { model.mapCenterChanged($0) }
             )
             .ignoresSafeArea()
+
+            // While the menu is open, a tap on the map closes it (rather than selecting things underneath).
+            if menu == .expanded {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture { closeMenu() }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("Close menu")
+            }
 
             VStack(spacing: 12) {
                 VStack(spacing: 8) {
