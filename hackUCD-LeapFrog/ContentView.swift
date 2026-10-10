@@ -18,7 +18,7 @@ struct ContentView: View {
                 estimatedPositions: model.estimatedPositions,
                 positionsVersion: model.positionsVersion,
                 trainPlacements: model.trainPlacements,
-                railShapes: model.railShapes,
+                railPaths: model.railPaths,
                 selectedRoute: model.selectedRoute,
                 cameraRequest: model.cameraRequest,
                 onSelect: { model.selection = $0 },

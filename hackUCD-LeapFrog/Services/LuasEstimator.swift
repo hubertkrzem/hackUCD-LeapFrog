@@ -42,6 +42,40 @@ nonisolated enum LuasEstimator {
         }
     }
 
+    /// Each running tram's predicted stop times as a timeline for `RailTracker`,
+    /// keyed by the same vehicle id `estimate` uses.
+    static func calls(tripUpdates: [GTFSRFeed.TripUpdate], data: StaticData) -> [String: [RailCall]] {
+        var result: [String: [RailCall]] = [:]
+        for update in tripUpdates {
+            guard let trip = update.trip, !trip.isCanceled, let tripId = trip.tripId,
+                  let patternIndex = data.luas.trips[tripId], data.luas.patterns.indices.contains(patternIndex)
+            else { continue }
+            let pattern = data.luas.patterns[patternIndex]
+            guard let times = predictedTimes(pattern: pattern, trip: trip, updates: update.stopTimeUpdate ?? []),
+                  let calls = calls(stopIds: pattern.stopIds, times: times, data: data) else { continue }
+            result["luas-\(tripId)"] = calls
+        }
+        return result
+    }
+
+    /// A tram's stop-by-stop timeline from one predicted time per stop.
+    static func calls(stopIds: [String], times: [Date], data: StaticData) -> [RailCall]? {
+        guard stopIds.count >= 2, stopIds.count == times.count else { return nil }
+        var calls: [RailCall] = []
+        for (i, stopId) in stopIds.enumerated() {
+            guard let stop = data.stopsById[stopId] else { return nil }
+            // GTFS gives one time per stop; trams leave after a short dwell.
+            let next = i + 1 < times.count ? times[i + 1].timeIntervalSince(times[i]) : 0
+            let dwell = min(RailTracker.tramDwell, max(next * 0.3, 0))
+            calls.append(RailCall(
+                stationId: stopId, latitude: stop.latitude, longitude: stop.longitude,
+                arrival: i == 0 ? nil : times[i],
+                departure: i == stopIds.count - 1 ? nil : times[i].addingTimeInterval(i == 0 ? 0 : dwell)
+            ))
+        }
+        return calls
+    }
+
     /// Predicted arrival time at each stop of the pattern.
     static func predictedTimes(
         pattern: LuasSchedule.Pattern,

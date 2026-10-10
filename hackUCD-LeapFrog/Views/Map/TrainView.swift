@@ -1,7 +1,7 @@
 import MapKit
 import UIKit
 
-/// A DART placed on the track. The map glides `distance` between the 1 s
+/// A DART or Luas placed on its track. The map glides `distance` between the 1 s
 /// tracker ticks; the view lays the carriages out behind it every frame.
 final class TrainAnnotation: NSObject, MKAnnotation {
     var vehicle: Vehicle
@@ -22,7 +22,8 @@ final class TrainAnnotation: NSObject, MKAnnotation {
 
     /// Heads for a new placement over the next tick, starting from wherever it is now.
     func retarget(_ new: RailTracker.Placement, now: CFTimeInterval) {
-        if new.shape != placement.shape || new.direction != placement.direction {
+        // A new path is measured differently; the tracker already made the switch seamless.
+        if new.pathKey != placement.pathKey {
             from = new.distance
             distance = new.distance
         } else {
@@ -52,7 +53,6 @@ struct TrainFrame: Equatable {
     let b: Double
     let cameraHeading: Double
     let metresPerPoint: Double
-    let carriagePt: CGFloat
 
     init(mapView: MKMapView) {
         let rect = mapView.visibleMapRect
@@ -66,8 +66,6 @@ struct TrainFrame: Equatable {
         b = Double(probeScreen.y - originScreen.y) / 1_000
         cameraHeading = mapView.camera.heading
         metresPerPoint = MKMetersPerMapPointAtLatitude(origin.coordinate.latitude) / max(hypot(a, b), 1e-9)
-        carriagePt = min(max(CGFloat(TrainView.realCarriageLength / metresPerPoint) * TrainView.exaggeration,
-                             TrainView.carriageRange.lowerBound), TrainView.carriageRange.upperBound)
     }
 
     func screen(latitude: Double, longitude: Double) -> CGPoint {
@@ -77,32 +75,59 @@ struct TrainFrame: Equatable {
     }
 }
 
-/// Six DART carriages (three two-car units) laid along the track as chords
-/// between their couplings, so the train bends through curves and stays coupled.
+/// The cars of a train or tram, front to back.
+struct Consist {
+    /// Each car's sprite, and whether it faces backwards.
+    let cars: [(model: SpriteModel, reversed: Bool)]
+    let realCarLength: Double
+    /// Screen length of a car, after zoom scaling.
+    let carRange: ClosedRange<CGFloat>
+    /// Sprite canvas, big enough for the longest car at any angle.
+    let spriteSide: CGFloat
+
+    /// Three two-car DART units; the cars in each unit face apart, so cabs meet at the couplings.
+    static let dart = Consist(cars: (0..<6).map { (.dartCar, $0 % 2 == 1) }, realCarLength: 20,
+                              carRange: 11...26, spriteSide: 34)
+    /// A three-section articulated Luas: cab, middle, cab facing back.
+    static let luas = Consist(cars: [(.luasCab, false), (.luasMiddle, false), (.luasCab, true)], realCarLength: 14.5,
+                              carRange: 9...20, spriteSide: 30)
+
+    static func `for`(_ mode: TransportMode) -> Consist { mode == .luas ? .luas : .dart }
+
+    /// How much longer than life cars are drawn, so they read at city zoom.
+    static let exaggeration: CGFloat = 2.5
+
+    func carPoints(metresPerPoint: Double) -> CGFloat {
+        min(max(CGFloat(realCarLength / metresPerPoint) * Self.exaggeration, carRange.lowerBound), carRange.upperBound)
+    }
+
+    /// Share of the sprite canvas a car spans when it lies across the screen.
+    var spriteFraction: CGFloat {
+        let model = cars[0].model
+        return CGFloat(model.carLength / (2 * model.orthographicScale))
+    }
+}
+
+/// A DART (six carriages) or Luas (three articulated sections) laid along its
+/// track as chords between the couplings, so it bends through curves and stays
+/// coupled.
 ///
-/// Each carriage is a cached sprite on a plain layer: a frame costs a few track
+/// Each car is a cached sprite on a plain layer: a frame costs a few track
 /// lookups and layer moves per train, never a 3D render.
 final class TrainView: MKAnnotationView {
     static let reuseID = "Train"
-    static let carriageCount = 6
-    /// Screen length of a carriage, before zoom scaling clamps it.
-    static let carriageRange: ClosedRange<CGFloat> = 11...26
-    /// How much longer than life carriages are drawn, so they read at city zoom.
-    static let exaggeration: CGFloat = 2.5
-    static let realCarriageLength = 20.0
+    static let maxCars = 6
     static let couplingGap: CGFloat = 0.5
-    /// Sprite canvas; the carriage spans `spriteCarriageFraction` of it when it lies across.
-    static let spriteSide: CGFloat = 34
-    static let spriteCarriageFraction = CGFloat(Double(VehicleModelFactory.dartCarLength) / (2 * SpriteModel.dartCar.orthographicScale))
 
     private static let elevation = 50 * Double.pi / 180
+    private var consist = Consist.dart
     private let carriages: [CALayer]
     private let caption = UILabel()
     /// What the carriages were last laid out for, to skip frames where nothing moved.
     private var laidOutFor: (distance: Double, frame: TrainFrame)?
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
-        carriages = (0..<Self.carriageCount).map { _ in
+        carriages = (0..<Self.maxCars).map { _ in
             let layer = CALayer()
             layer.contentsGravity = .resize
             layer.minificationFilter = .trilinear
@@ -139,28 +164,35 @@ final class TrainView: MKAnnotationView {
 
     func configure(with vehicle: Vehicle, eta: String?) {
         zPriority = .max
-        if caption.text != eta { laidOutFor = nil }
+        let consist = Consist.for(vehicle.mode)
+        if caption.text != eta || consist.cars.count != self.consist.cars.count || consist.cars[0].model != self.consist.cars[0].model {
+            laidOutFor = nil
+        }
+        self.consist = consist
+        for (k, layer) in carriages.enumerated() { layer.isHidden = k >= consist.cars.count }
         caption.isHidden = eta == nil
         caption.text = eta
-        accessibilityLabel = "DART\(vehicle.headsign.map { " to \($0)" } ?? "")"
+        accessibilityLabel = "\(vehicle.mode.title)\(vehicle.headsign.map { " to \($0)" } ?? "")"
     }
 
-    /// Taps anywhere on a carriage select the train.
+    /// Taps anywhere on a car select the train.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        carriages.contains { $0.frame.insetBy(dx: $0.frame.width * 0.15, dy: $0.frame.height * 0.15).contains(point) }
+        carriages.contains { !$0.isHidden && $0.frame.insetBy(dx: $0.frame.width * 0.15, dy: $0.frame.height * 0.15).contains(point) }
     }
 
-    /// Places every carriage for the train's current distance along `shape`.
+    /// Places every car for the vehicle's current distance along `shape` (its
+    /// journey's path, so it always runs towards increasing distance).
     /// Returns false if nothing needed to move.
     @discardableResult
-    func layout(distance: Double, direction: Double, shape: RouteShape, frame: TrainFrame) -> Bool {
+    func layout(distance: Double, shape: RouteShape, frame: TrainFrame) -> Bool {
         guard let annotation else { return false }
         if let last = laidOutFor, last.distance == distance, last.frame == frame { return false }
         laidOutFor = (distance, frame)
         let anchor = frame.screen(latitude: annotation.coordinate.latitude, longitude: annotation.coordinate.longitude)
         let cameraHeading = frame.cameraHeading
         let metresPerPoint = frame.metresPerPoint
-        let carriagePt = frame.carriagePt
+        let carriagePt = consist.carPoints(metresPerPoint: metresPerPoint)
+        let count = consist.cars.count
 
         // Couplings, front to back. A carriage's on-screen length depends on its angle
         // (the sprite camera looks down at 50°), so each step is sized to the track there.
@@ -168,26 +200,30 @@ final class TrainView: MKAnnotationView {
             let screenAngle = (shape.point(at: d).bearing - cameraHeading) * .pi / 180
             return Double(carriagePt * Self.footprint(screenAngle: screenAngle) + Self.couplingGap) * metresPerPoint
         }
-        let half = Self.carriageCount / 2
-        var couplings = [Double](repeating: distance, count: Self.carriageCount + 1)
+        // Centred on `distance`: the middle coupling, or the middle of the middle car.
+        var couplings = [Double](repeating: distance, count: count + 1)
+        let half = count / 2
+        if count % 2 == 1 {
+            let middle = step(at: distance) / 2
+            couplings[half] = distance + middle
+            couplings[half + 1] = distance - middle
+        }
         for k in stride(from: half - 1, through: 0, by: -1) {
-            couplings[k] = couplings[k + 1] + direction * step(at: couplings[k + 1])
+            couplings[k] = couplings[k + 1] + step(at: couplings[k + 1])
         }
-        for k in (half + 1)...Self.carriageCount {
-            couplings[k] = couplings[k - 1] - direction * step(at: couplings[k - 1])
+        for k in (count % 2 == 1 ? half + 2 : half + 1)...count {
+            couplings[k] = couplings[k - 1] - step(at: couplings[k - 1])
         }
-        // Keep the whole train on the track at the termini.
-        let overshoot = direction > 0 ? max(couplings[0] - shape.length, 0) : min(couplings[0], 0)
-        let undershoot = direction > 0 ? min(couplings[Self.carriageCount], 0) : max(couplings[Self.carriageCount] - shape.length, 0)
-        let shift = overshoot - undershoot
+        // Keep the whole train on the track at the ends of its path.
+        let shift = max(couplings[0] - shape.length, 0) + min(couplings[count], 0)
         let points = couplings.map { d -> CGPoint in
             let p = shape.point(at: d - shift)
             let screen = frame.screen(latitude: p.latitude, longitude: p.longitude)
             return CGPoint(x: screen.x - anchor.x, y: screen.y - anchor.y)
         }
 
-        let side = carriagePt / Self.spriteCarriageFraction
-        let lift = VehicleSpriteRenderer.groundOffset(side: side, model: .dartCar)
+        let side = carriagePt / consist.spriteFraction
+        let lift = VehicleSpriteRenderer.groundOffset(side: side, model: consist.cars[0].model)
         // MapKit hit-tests the view's frame, so grow it (centred on the anchor) to cover the train.
         let extent = points.reduce(0) { max($0, abs($1.x), abs($1.y)) } + side
         let size = (extent * 2 / 16).rounded(.up) * 16
@@ -196,15 +232,16 @@ final class TrainView: MKAnnotationView {
         }
         let centre = CGPoint(x: bounds.midX, y: bounds.midY)
         let local = points.map { CGPoint(x: $0.x + centre.x, y: $0.y + centre.y) }
-        for (k, layer) in carriages.enumerated() {
+        for (k, car) in consist.cars.enumerated() {
+            let layer = carriages[k]
             let front = local[k], back = local[k + 1]
             let mid = CGPoint(x: (front.x + back.x) / 2, y: (front.y + back.y) / 2)
-            // Screen angle of the chord, clockwise from up; carriages in each unit face apart.
+            // Screen angle of the chord, clockwise from up; reversed cars face the other way.
             var chord = atan2(Double(front.x - back.x), Double(back.y - front.y))
-            if k % 2 == 1 { chord += .pi }
+            if car.reversed { chord += .pi }
             let yaw = atan2(sin(Self.elevation) * sin(chord), cos(chord))
             let bucket = VehicleSpriteRenderer.bucket(for: yaw * 180 / .pi)
-            layer.contents = TrainSpriteCache.image(bucket: bucket)?.cgImage
+            layer.contents = TrainSpriteCache.image(car.model, bucket: bucket, side: consist.spriteSide)?.cgImage
             // Turn the nearest pre-rendered angle the last few degrees onto the chord.
             let bucketYaw = Double(bucket) * VehicleSpriteRenderer.bucketDegrees * .pi / 180
             let bucketChord = atan2(sin(bucketYaw), cos(bucketYaw) * sin(Self.elevation))
@@ -231,15 +268,21 @@ final class TrainView: MKAnnotationView {
     }
 }
 
-/// One carriage model at every heading bucket. Rear-facing cars reuse the
-/// sprite turned 180°, so a whole fleet needs 24 renders.
+/// Each car model at every heading bucket. Rear-facing cars reuse the sprite
+/// turned 180°, so the whole fleet needs 24 renders per car model.
 enum TrainSpriteCache {
-    private static var images: [Int: UIImage] = [:]
+    private struct Key: Hashable {
+        let model: SpriteModel
+        let bucket: Int
+    }
 
-    static func image(bucket: Int) -> UIImage? {
-        if let cached = images[bucket] { return cached }
-        let image = VehicleSpriteRenderer.image(model: .dartCar, bucket: bucket, side: TrainView.spriteSide)
-        images[bucket] = image
+    private static var images: [Key: UIImage] = [:]
+
+    static func image(_ model: SpriteModel, bucket: Int, side: CGFloat) -> UIImage? {
+        let key = Key(model: model, bucket: bucket)
+        if let cached = images[key] { return cached }
+        let image = VehicleSpriteRenderer.image(model: model, bucket: bucket, side: side)
+        images[key] = image
         return image
     }
 }
